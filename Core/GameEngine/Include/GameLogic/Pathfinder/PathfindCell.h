@@ -22,6 +22,9 @@
 
 class Object;
 class PathfindCellList;
+#if !RETAIL_COMPATIBLE_PATHFINDING
+class PathfindOpenHeap;
+#endif
 
 typedef UnsignedShort zoneStorageType;
 
@@ -100,11 +103,30 @@ public:
 	// Reverse insertion sort, in ascending cost order
 	void reverseInsertionSort(PathfindCellList& list);
 
+#if RETAIL_COMPATIBLE_PATHFINDING
 	/// put self on "open" list in ascending cost order
 	void putOnSortedOpenList( PathfindCellList &list );
 
 	/// remove self from "open" list
 	void removeFromOpenList( PathfindCellList &list );
+
+	/// remove all cells from open list.
+	static Int releaseOpenList( PathfindCellList &list );
+#else
+	/// put self on "open" heap in ascending cost order
+	void putOnSortedOpenList( PathfindOpenHeap &heap );
+
+	/// remove self from "open" heap
+	void removeFromOpenList( PathfindOpenHeap &heap );
+
+	/// remove all cells from open heap.
+	static Int releaseOpenList( PathfindOpenHeap &heap );
+
+	Int getHeapIndex() const { return m_info ? m_info->m_heapIndex : -1; }
+	void setHeapIndex(Int idx) { if (m_info) m_info->m_heapIndex = idx; }
+	void setOpenFlag(Bool isOpen) { if (m_info) m_info->m_open = isOpen ? 1 : 0; }
+	void setClosedFlag(Bool isClosed) { if (m_info) m_info->m_closed = isClosed ? 1 : 0; }
+#endif
 
 	/// put self on "closed" list, return new list
 	void putOnClosedList( PathfindCellList &list );
@@ -114,9 +136,6 @@ public:
 
 	/// remove all cells from closed list.
 	static Int releaseClosedList( PathfindCellList &list );
-
-	/// remove all cells from closed list.
-	static Int releaseOpenList( PathfindCellList &list );
 
 	PathfindCell *getNextOpen() {return m_info->m_nextOpen?m_info->m_nextOpen->m_cell: nullptr;}
 	PathfindCell *getPrevOpen() {return m_info->m_prevOpen?m_info->m_prevOpen->m_cell: nullptr;}

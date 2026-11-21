@@ -37,6 +37,11 @@
 #include "Pathfinder/PathfindCell.h"
 #include "Pathfinder/PathfindCellInfo.h"
 #include "Pathfinder/PathfindCellList.h"
+#if !RETAIL_COMPATIBLE_PATHFINDING
+#include "Pathfinder/PathfindFlowField.h"
+#include "Pathfinder/PathfindOpenHeap.h"
+#include "Pathfinder/PathfindRequestQueue.h"
+#endif
 #include "Pathfinder/PathfindConstants.h"
 #include "Pathfinder/PathfindLayer.h"
 #include "Pathfinder/PathfindZoneManager.h"
@@ -254,6 +259,9 @@ public:
 
 protected:
 	virtual Path *internalFindPath( Object *obj, const LocomotorSet& locomotorSet, const Coord3D *from, const Coord3D *to);	///< Find a short, valid path between given locations
+#if !RETAIL_COMPATIBLE_PATHFINDING
+	Path *tryFindPathViaFlowField( Object *obj, const LocomotorSet& locomotorSet, Bool isHuman, const Coord3D *from, const Coord3D *rawTo );
+#endif
 	Path *findHierarchicalPath( Bool isHuman, const LocomotorSet& locomotorSet, const Coord3D *from, const Coord3D *to, Bool crusher);
 	Path *findClosestHierarchicalPath( Bool isHuman, const LocomotorSet& locomotorSet, const Coord3D *from, const Coord3D *to, Bool crusher);
 	Path *internal_findHierarchicalPath( Bool isHuman, const LocomotorSurfaceTypeMask locomotorSurface, const Coord3D *from, const Coord3D *to, Bool crusher, Bool closestOK);
@@ -358,7 +366,11 @@ private:
 	IRegion2D m_extent;														///< Grid extent limits
 	IRegion2D m_logicalExtent;										///< Logical grid extent limits
 
+#if RETAIL_COMPATIBLE_PATHFINDING
 	PathfindCellList m_openList;									///< Cells ready to be explored
+#else
+	PathfindOpenHeap m_openList;									///< 4-ary indexed min-heap of cells ready to be explored
+#endif
 	PathfindCellList m_closedList;								///< Cells already explored
 
 	Bool m_isMapReady;														///< True if all cells of map have been classified
@@ -386,9 +398,14 @@ private:
 
 
 	// Pathfind queue
+#if RETAIL_COMPATIBLE_PATHFINDING
 	ObjectID			m_queuedPathfindRequests[PATHFIND_QUEUE_LEN];
 	Int						m_queuePRHead;
 	Int						m_queuePRTail;
+#else
+	PathfindRequestQueue	m_pathfindQueue;
+	PathfindFlowFieldManager m_flowFieldManager;
+#endif
 	Int						m_cumulativeCellsAllocated;
 
 #if RTS_ZEROHOUR && RETAIL_COMPATIBLE_CRC

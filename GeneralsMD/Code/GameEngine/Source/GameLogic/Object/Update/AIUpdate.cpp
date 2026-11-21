@@ -238,6 +238,9 @@ AIUpdateInterface::AIUpdateInterface( Thing *thing, const ModuleData* moduleData
 	m_bumpSpeedLimit = FAST_AS_POSSIBLE;
 	m_ignoreCollisionsUntil = 0;
 	m_queueForPathFrame = 0;
+#if !RETAIL_COMPATIBLE_PATHFINDING
+	m_consecutivePathFailures = 0;
+#endif
 	m_finalPosition.zero();
 	m_repulsor1 = INVALID_ID;
 	m_repulsor2 = INVALID_ID;
@@ -1739,6 +1742,9 @@ Bool AIUpdateInterface::computePath( PathfindServicesInterface *pathServices, Co
 	}
 	TheAI->pathfinder()->setIgnoreObstacleID( INVALID_ID );
 	if (theNewPath) {
+#if !RETAIL_COMPATIBLE_PATHFINDING
+		m_consecutivePathFailures = 0;
+#endif
 		// destroy previous path
 		destroyPath();
 		m_path = theNewPath;
@@ -1753,9 +1759,15 @@ Bool AIUpdateInterface::computePath( PathfindServicesInterface *pathServices, Co
 		// Keep using the old path.
  		if (m_path && m_isBlockedAndStuck) {
 			destroyPath();
-			// Stop and wait one second.
-
+			// Stop and wait with deterministic backoff so crowded armies don't flood patchPath.
+#if RETAIL_COMPATIBLE_PATHFINDING
 			setQueueForPathTime(LOGICFRAMES_PER_SECOND);
+#else
+			if (m_consecutivePathFailures < 4) {
+				++m_consecutivePathFailures;
+			}
+			setQueueForPathTime(LOGICFRAMES_PER_SECOND * m_consecutivePathFailures);
+#endif
 			Coord3D goalPos;
 			Object *obj = getObject();
 			goalPos = *obj->getPosition();

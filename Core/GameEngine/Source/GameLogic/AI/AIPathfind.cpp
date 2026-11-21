@@ -202,11 +202,16 @@ void Pathfinder::reset()
 
 	m_frameToShowObstacles = 0;
 
+#if RETAIL_COMPATIBLE_PATHFINDING
 	for (m_queuePRHead=0; m_queuePRHead<PATHFIND_QUEUE_LEN; m_queuePRHead++) {
 		m_queuedPathfindRequests[m_queuePRHead] = INVALID_ID;
 	}
 	m_queuePRHead = 0;
 	m_queuePRTail = 0;
+#else
+	m_pathfindQueue.reset();
+	m_flowFieldManager.reset();
+#endif
 
 	m_numWallPieces = 0;
 	for (i=0; i<MAX_WALL_PIECES; ++i)
@@ -367,7 +372,7 @@ void Pathfinder::classifyFence( Object *obj, Bool insert )
 	cellBounds.lo.x = REAL_TO_INT_FLOOR((pos->x + 0.5f)/PATHFIND_CELL_SIZE_F);
 	cellBounds.lo.y = REAL_TO_INT_FLOOR((pos->y + 0.5f)/PATHFIND_CELL_SIZE_F);
 	// TheSuperHackers @fix Mauller 16/06/2025 Fixes uninitialized variables.
-#if RETAIL_COMPATIBLE_CRC
+#if RTS_ZEROHOUR && RETAIL_COMPATIBLE_CRC
 	//CRCDEBUG_LOG(("Pathfinder::classifyFence - (%d,%d)", cellBounds.hi.x, cellBounds.hi.y));
 
 	// For retail the values on the stack are often either 0 or larger than the map size.
@@ -436,6 +441,9 @@ void Pathfinder::classifyFence( Object *obj, Bool insert )
 	if (didAnything) {
 		m_zoneManager.markZonesDirty();
 		m_zoneManager.updateZonesForModify(m_map, m_layers, cellBounds, m_extent);
+#if !RETAIL_COMPATIBLE_PATHFINDING
+		m_flowFieldManager.invalidateCache();
+#endif
 	}
 #endif
 }
@@ -701,6 +709,9 @@ void Pathfinder::internal_classifyObjectFootprint( Object *obj, Bool insert )
 	cellBounds.hi.y = REAL_TO_INT_CEIL(bounds.hi.y/PATHFIND_CELL_SIZE_F)+1;
 #else
 	m_zoneManager.updateZonesForModify(m_map, m_layers, cellBounds, m_extent);
+#if !RETAIL_COMPATIBLE_PATHFINDING
+	m_flowFieldManager.invalidateCache();
+#endif
 
 	cellBounds.lo.x -= 2;
 	cellBounds.lo.y -= 2;
@@ -973,6 +984,9 @@ void Pathfinder::classifyMap()
 		m_layers[LAYER_WALL].classifyWallCells(m_wallPieces, m_numWallPieces);
 	}
 	m_zoneManager.calculateZones(m_map, m_layers, m_extent);
+#if !RETAIL_COMPATIBLE_PATHFINDING
+	m_flowFieldManager.invalidateCache();
+#endif
 }
 
 
@@ -1003,8 +1017,15 @@ void Pathfinder::debugShowSearch(  Bool pathFound  )
 		addIcon(nullptr, 0, 0, color);	 // erase.
 	}
 
+#if RETAIL_COMPATIBLE_PATHFINDING
 	for( s = m_openList.getHead(); s; s=s->getNextOpen() )
+#else
+	for( size_t openIdx = 0; openIdx < m_openList.size(); ++openIdx )
+#endif
 	{
+#if !RETAIL_COMPATIBLE_PATHFINDING
+		s = m_openList.getAt(openIdx);
+#endif
 		// create objects to show path - they decay
 		RGBColor color;
 		color.red = color.green = 0;
@@ -1943,6 +1964,7 @@ Bool Pathfinder::queueForPath(ObjectID id)
 	}
 #endif
 
+#if RETAIL_COMPATIBLE_PATHFINDING
 	/* Check & see if we are already queued. */
 	Int slot = m_queuePRHead;
 	while (slot != m_queuePRTail) {
@@ -1967,6 +1989,9 @@ Bool Pathfinder::queueForPath(ObjectID id)
 	m_queuedPathfindRequests[m_queuePRTail] = id;
 	m_queuePRTail = nextSlot;
 	return true;
+#else
+	return m_pathfindQueue.enqueue(id);
+#endif
 }
 
 #if defined(RTS_DEBUG)
@@ -2175,6 +2200,9 @@ void Pathfinder::processPathfindQueue()
 
 	if (m_zoneManager.needToCalculateZones()) {
 		m_zoneManager.calculateZones(m_map, m_layers, m_extent);
+#if !RETAIL_COMPATIBLE_PATHFINDING
+		m_flowFieldManager.invalidateCache();
+#endif
 		return;
 	}
 
@@ -2192,6 +2220,7 @@ void Pathfinder::processPathfindQueue()
 
 	m_cumulativeCellsAllocated = 0;	// Number of pathfind cells examined.
 	Int pathsFound = 0;
+#if RETAIL_COMPATIBLE_PATHFINDING
 	while (m_cumulativeCellsAllocated < PATHFIND_CELLS_PER_FRAME &&
 		m_queuePRTail!=m_queuePRHead) {
 		Object *obj = TheGameLogic->findObjectByID(m_queuedPathfindRequests[m_queuePRHead]);
@@ -2208,6 +2237,20 @@ void Pathfinder::processPathfindQueue()
 			m_queuePRHead = 0;
 		}
 	}
+#else
+	ObjectID queuedID = INVALID_ID;
+	while (m_cumulativeCellsAllocated < static_cast<Int>(PATHFIND_CELLS_PER_FRAME) &&
+		m_pathfindQueue.dequeue(queuedID)) {
+		Object *obj = TheGameLogic->findObjectByID(queuedID);
+		if (obj) {
+			AIUpdateInterface *ai = obj->getAIUpdateInterface();
+			if (ai) {
+				ai->doPathfind(this);
+				pathsFound++;
+			}
+		}
+	}
+#endif
 	if (pathsFound > 0) {
 		PROFILER_PLOT("PathfindCells", (double)m_cumulativeCellsAllocated);
 		PROFILER_PLOT("PathfindPaths", (double)pathsFound);
@@ -2613,6 +2656,181 @@ Int Pathfinder::examineNeighboringCells(PathfindCell *parentCell, PathfindCell *
 }
 
 
+#if !RETAIL_COMPATIBLE_PATHFINDING
+/**
+ * Attempts to construct a native Path using the deterministic LRU-cached Flow Field
+ * engine when multiple units target the same destination cluster and terrain zone.
+ * Returns nullptr to seamlessly fall back to 4-ary heap A* for lone units, short
+ * local hops, bridges/walls, tunneling, dozers, or special ignored obstacles.
+ */
+Path *Pathfinder::tryFindPathViaFlowField(
+	Object *obj,
+	const LocomotorSet& locomotorSet,
+	Bool isHuman,
+	const Coord3D *from,
+	const Coord3D *rawTo)
+{
+	if (!m_isMapReady || obj == nullptr || from == nullptr || rawTo == nullptr) {
+		return nullptr;
+	}
+	if (rawTo->x == 0.0f && rawTo->y == 0.0f) {
+		return nullptr;
+	}
+	if (m_ignoreObstacleID != INVALID_ID) {
+		return nullptr;
+	}
+	if (obj->isKindOf(KINDOF_DOZER) || obj->isKindOf(KINDOF_CLIFF_JUMPER)) {
+		return nullptr;
+	}
+	if (obj->getAIUpdateInterface() && obj->getAIUpdateInterface()->getIgnoredObstacleID() != INVALID_ID) {
+		return nullptr;
+	}
+
+	const PathfindLayerEnum startLayer = obj->getLayer();
+	if (startLayer != LAYER_GROUND) {
+		return nullptr;
+	}
+
+	Int radius = 0;
+	Bool centerInCell = true;
+	getRadiusAndCenter(obj, radius, centerInCell);
+
+	Coord3D adjustTo = *rawTo;
+	Coord3D clipFrom = *from;
+	clip(&clipFrom, &adjustTo);
+	if (!centerInCell) {
+		adjustTo.x += PATHFIND_CELL_SIZE_F / 2.0f;
+		adjustTo.y += PATHFIND_CELL_SIZE_F / 2.0f;
+	}
+
+	const PathfindLayerEnum destLayer = TheTerrainLogic->getLayerForDestination(&adjustTo);
+	if (destLayer != LAYER_GROUND) {
+		return nullptr;
+	}
+
+	ICoord2D startCoord;
+	ICoord2D goalCoord;
+	worldToCell(&clipFrom, &startCoord);
+	worldToCell(&adjustTo, &goalCoord);
+
+	// Very short local moves are faster and more unit-aware via direct A*.
+	const Int dx = (goalCoord.x > startCoord.x) ? (goalCoord.x - startCoord.x) : (startCoord.x - goalCoord.x);
+	const Int dy = (goalCoord.y > startCoord.y) ? (goalCoord.y - startCoord.y) : (startCoord.y - goalCoord.y);
+	if (dx <= 6 && dy <= 6) {
+		return nullptr;
+	}
+
+	const IRegion2D &activeBounds =
+		(isHuman && m_logicalExtent.hi.x > m_logicalExtent.lo.x && m_logicalExtent.hi.y > m_logicalExtent.lo.y)
+		? m_logicalExtent
+		: m_extent;
+
+	if (startCoord.x < activeBounds.lo.x || startCoord.x > activeBounds.hi.x ||
+		startCoord.y < activeBounds.lo.y || startCoord.y > activeBounds.hi.y ||
+		goalCoord.x < activeBounds.lo.x || goalCoord.x > activeBounds.hi.x ||
+		goalCoord.y < activeBounds.lo.y || goalCoord.y > activeBounds.hi.y) {
+		return nullptr;
+	}
+
+	const Bool isCrusher = obj->getCrusherLevel() > 0;
+	const LocomotorSurfaceTypeMask surfaces = locomotorSet.getValidSurfaces();
+	PathfindCell *startCell = getCell(LAYER_GROUND, startCoord.x, startCoord.y);
+	PathfindCell *goalCell = getCell(LAYER_GROUND, goalCoord.x, goalCoord.y);
+	if (startCell == nullptr || goalCell == nullptr) {
+		return nullptr;
+	}
+	if (!validMovementPosition(isCrusher, surfaces, startCell) ||
+		!validMovementPosition(isCrusher, surfaces, goalCell)) {
+		return nullptr;
+	}
+	if (!checkDestination(obj, goalCoord.x, goalCoord.y, LAYER_GROUND, radius, centerInCell)) {
+		return nullptr;
+	}
+
+	const zoneStorageType zone1 = m_zoneManager.getEffectiveZone(surfaces, isCrusher, startCell->getZone());
+	const zoneStorageType zone2 = m_zoneManager.getEffectiveZone(surfaces, isCrusher, goalCell->getZone());
+	if (zone1 != zone2 || zone2 == 0) {
+		return nullptr;
+	}
+
+	PathfindFlowFieldManager::FlowFieldKey key;
+	key.goalClusterX = goalCoord.x >> PathfindFlowFieldManager::CLUSTER_SHIFT;
+	key.goalClusterY = goalCoord.y >> PathfindFlowFieldManager::CLUSTER_SHIFT;
+	key.goalZone = zone2;
+	key.acceptableSurfaces = surfaces;
+	key.isCrusher = isCrusher;
+	key.isHuman = isHuman;
+
+	const UnsignedInt currentFrame = TheGameLogic ? TheGameLogic->getFrame() : 0;
+	if (!m_flowFieldManager.recordDemandAndShouldUse(key, currentFrame)) {
+		return nullptr;
+	}
+
+	const PathfindFlowFieldManager::FlowFieldEntry *field = m_flowFieldManager.findCached(key);
+	if (field == nullptr) {
+		const Int width = m_extent.hi.x + 1;
+		const Int height = m_extent.hi.y + 1;
+		const size_t totalCells = static_cast<size_t>(width) * static_cast<size_t>(height);
+		std::vector<UnsignedByte> &passGrid = m_flowFieldManager.getPassabilityScratch(totalCells);
+		std::fill(passGrid.begin(), passGrid.begin() + totalCells, static_cast<UnsignedByte>(PathfindFlowFieldManager::PASS_BLOCKED));
+
+		for (Int x = activeBounds.lo.x; x <= activeBounds.hi.x; ++x) {
+			PathfindCell *col = m_map[x];
+			UnsignedByte *dstCol = &passGrid[static_cast<size_t>(x) * static_cast<size_t>(height)];
+			for (Int y = activeBounds.lo.y; y <= activeBounds.hi.y; ++y) {
+				PathfindCell *c = &col[y];
+				if (validMovementPosition(isCrusher, surfaces, c)) {
+					dstCol[y] = c->getPinched()
+						? static_cast<UnsignedByte>(PathfindFlowFieldManager::PASS_SOFT_PENALTY)
+						: static_cast<UnsignedByte>(PathfindFlowFieldManager::PASS_CLEAR);
+				}
+			}
+		}
+
+		field = m_flowFieldManager.buildFlowField(key, width, height, activeBounds, goalCoord.x, goalCoord.y, passGrid.data());
+		if (field == nullptr) {
+			return nullptr;
+		}
+	}
+
+	std::vector<ICoord2D> waypoints;
+	waypoints.reserve(64);
+	if (!PathfindFlowFieldManager::tracePath(*field, startCoord.x, startCoord.y, goalCoord.x, goalCoord.y, waypoints) || waypoints.empty()) {
+		return nullptr;
+	}
+
+	// If the flow field seed differs from this unit's exact cell inside the 4x4 cluster,
+	// ensure the final short hop (<= 3 cells) is clear of static obstacles.
+	if (field->seedX != goalCoord.x || field->seedY != goalCoord.y) {
+		const Int hopDx = goalCoord.x - field->seedX;
+		const Int hopDy = goalCoord.y - field->seedY;
+		const Int steps = (abs(hopDx) > abs(hopDy)) ? abs(hopDx) : abs(hopDy);
+		for (Int s = 1; s <= steps; ++s) {
+			const Int cx = field->seedX + (hopDx * s) / steps;
+			const Int cy = field->seedY + (hopDy * s) / steps;
+			if (!validMovementPosition(isCrusher, surfaces, getCell(LAYER_GROUND, cx, cy))) {
+				return nullptr;
+			}
+		}
+	}
+
+	Path *path = newInstance(Path);
+	Coord3D startPos = *from;
+	startPos.z = TheTerrainLogic->getLayerHeight(startPos.x, startPos.y, LAYER_GROUND);
+	path->appendNode(&startPos, LAYER_GROUND);
+
+	for (size_t i = 0; i < waypoints.size(); ++i) {
+		Coord3D wpPos;
+		adjustCoordToCell(waypoints[i].x, waypoints[i].y, centerInCell, wpPos, LAYER_GROUND);
+		path->appendNode(&wpPos, LAYER_GROUND);
+	}
+
+	path->optimize(obj, surfaces, false);
+	m_cumulativeCellsAllocated += static_cast<Int>(waypoints.size()) + 4;
+	return path;
+}
+#endif
+
 /**
  * Find a short, valid path between given locations.
  * Uses A* algorithm.
@@ -2627,6 +2845,12 @@ Path *Pathfinder::findPath( Object *obj, const LocomotorSet& locomotorSet, const
 	if (obj && obj->getControllingPlayer() && (obj->getControllingPlayer()->getPlayerType()==PLAYER_COMPUTER)) {
 		isHuman = false; // computer gets to cheat.
 	}
+
+#if !RETAIL_COMPATIBLE_PATHFINDING
+	if (Path *flowPath = tryFindPathViaFlowField(obj, locomotorSet, isHuman, from, rawTo)) {
+		return flowPath;
+	}
+#endif
 
 	m_zoneManager.clearPassableFlags();
 	Path *hPat = findHierarchicalPath(isHuman, locomotorSet, from, rawTo, false);
@@ -5961,6 +6185,9 @@ void Pathfinder::changeBridgeState( PathfindLayerEnum layer, Bool repaired)
 	if (m_layers[layer].isUnused()) return;
 	if (m_layers[layer].setDestroyed(!repaired)) {
 		m_zoneManager.markZonesDirty();
+#if !RETAIL_COMPATIBLE_PATHFINDING
+		m_flowFieldManager.invalidateCache();
+#endif
 	}
 }
 
@@ -7476,12 +7703,17 @@ void Pathfinder::crc( Xfer *xfer )
 	xfer->xferUser(&m_ignoreObstacleID, sizeof(ObjectID));
 	CRCDEBUG_LOG(("m_ignoreObstacleID: %8.8X", ((XferCRC *)xfer)->getCRC()));
 
+#if RETAIL_COMPATIBLE_PATHFINDING
 	xfer->xferUser(m_queuedPathfindRequests, sizeof(ObjectID)*PATHFIND_QUEUE_LEN);
 	CRCDEBUG_LOG(("m_queuedPathfindRequests: %8.8X", ((XferCRC *)xfer)->getCRC()));
 	xfer->xferInt(&m_queuePRHead);
 	CRCDEBUG_LOG(("m_queuePRHead: %8.8X", ((XferCRC *)xfer)->getCRC()));
 	xfer->xferInt(&m_queuePRTail);
 	CRCDEBUG_LOG(("m_queuePRTail: %8.8X", ((XferCRC *)xfer)->getCRC()));
+#else
+	m_pathfindQueue.crc(xfer);
+	CRCDEBUG_LOG(("m_pathfindQueue: %8.8X", ((XferCRC *)xfer)->getCRC()));
+#endif
 
 	xfer->xferInt(&m_numWallPieces);
 	CRCDEBUG_LOG(("m_numWallPieces: %8.8X", ((XferCRC *)xfer)->getCRC()));

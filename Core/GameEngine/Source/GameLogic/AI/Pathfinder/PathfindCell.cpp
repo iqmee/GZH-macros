@@ -21,6 +21,9 @@
 #include "GameLogic/Pathfinder/PathfindCellInfo.h"
 #include "GameLogic/Pathfinder/PathfindCellList.h"
 #include "GameLogic/Pathfinder/PathfindConstants.h"
+#if !RETAIL_COMPATIBLE_PATHFINDING
+#include "GameLogic/Pathfinder/PathfindOpenHeap.h"
+#endif
 #include "GameLogic/Module/BodyModule.h"
 
 /**
@@ -78,6 +81,9 @@ Bool PathfindCell::startPathfind( PathfindCell *goalCell  )
 	DEBUG_ASSERTCRASH(m_info, ("Has to have info."));
 	m_info->m_nextOpen = nullptr;
 	m_info->m_prevOpen = nullptr;
+#if !RETAIL_COMPATIBLE_PATHFINDING
+	m_info->m_heapIndex = -1;
+#endif
 	m_info->m_pathParent = nullptr;
 	m_info->m_costSoFar = 0;		// start node, no cost to get here
 	m_info->m_totalCost = 0;
@@ -633,15 +639,14 @@ void PathfindCell::reverseInsertionSort(PathfindCellList& list)
 	m_info->m_nextOpen = current->m_info;
 }
 
+#if RETAIL_COMPATIBLE_PATHFINDING
 /// put self on "open" list in ascending cost order, return new list
 void PathfindCell::putOnSortedOpenList( PathfindCellList &list )
 {
-#if RETAIL_COMPATIBLE_PATHFINDING
 	if (!s_useFixedPathfinding) {
 		forwardInsertionSortRetailCompatible(list);
 		return;
 	}
-#endif
 
 	// TheSuperHackers @performance Mauller 20/03/2026 Implement reverse insertion sorting.
 	// Long and complex paths often append PathfindCell's, with high total path costs, to the open list.
@@ -687,7 +692,6 @@ Int PathfindCell::releaseOpenList( PathfindCellList &list )
 		PathfindCell *cur = list.m_head;
 		PathfindCellInfo *curInfo = list.m_head->m_info;
 
-#if RETAIL_COMPATIBLE_PATHFINDING
 		// TheSuperHackers @info This is only here to catch a crash point in the retail compatible pathfinding
 		// One crash mode is where a cell has no PathfindCellInfo, resulting in a nullptr access and a crash.
 		// Therefore we signal that we need to clean the maps cells and the PathfindCellInfos
@@ -696,7 +700,6 @@ Int PathfindCell::releaseOpenList( PathfindCellList &list )
 			s_forceCleanCells = true;
 			return count;
 		}
-#endif
 
 		if (curInfo->m_nextOpen) {
 			list.m_head = curInfo->m_nextOpen->m_cell;
@@ -711,6 +714,22 @@ Int PathfindCell::releaseOpenList( PathfindCellList &list )
 	}
 	return count;
 }
+#else
+void PathfindCell::putOnSortedOpenList( PathfindOpenHeap &heap )
+{
+	heap.push(this);
+}
+
+void PathfindCell::removeFromOpenList( PathfindOpenHeap &heap )
+{
+	heap.remove(this);
+}
+
+Int PathfindCell::releaseOpenList( PathfindOpenHeap &heap )
+{
+	return heap.releaseAll();
+}
+#endif
 
 /// remove all cells from "closed" list
 Int PathfindCell::releaseClosedList( PathfindCellList &list )

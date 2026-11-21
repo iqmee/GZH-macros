@@ -41,7 +41,11 @@ constexpr const UnsignedInt MAX_ADJUSTMENT_CELL_COUNT = 400;
 constexpr const UnsignedInt MAX_SAFE_PATH_CELL_COUNT = 2000;
 
 // Number of cells we will search pathfinding per frame.
+#if RETAIL_COMPATIBLE_PATHFINDING
 constexpr const UnsignedInt PATHFIND_CELLS_PER_FRAME = 5000;
+#else
+constexpr const UnsignedInt PATHFIND_CELLS_PER_FRAME = 25000;
+#endif
 
 constexpr const Int COST_ORTHOGONAL = 10;
 constexpr const Int COST_DIAGONAL = 14;

@@ -19,7 +19,11 @@
 #include "PreRTS.h"
 #include "GameLogic/Pathfinder/PathfindCellInfo.h"
 
+#if RETAIL_COMPATIBLE_PATHFINDING
 constexpr const UnsignedInt CELL_INFOS_TO_ALLOCATE = 30000;
+#else
+constexpr const UnsignedInt CELL_INFOS_TO_ALLOCATE = 131072;
+#endif
 
 PathfindCellInfo *PathfindCellInfo::s_infoArray = nullptr;
 PathfindCellInfo *PathfindCellInfo::s_firstFree = nullptr;
@@ -87,6 +91,9 @@ PathfindCellInfo *PathfindCellInfo::getACellInfo(PathfindCell *cell,const ICoord
 
 		info->m_nextOpen = nullptr;
 		info->m_prevOpen = nullptr;
+#if !RETAIL_COMPATIBLE_PATHFINDING
+		info->m_heapIndex = -1;
+#endif
 		info->m_pathParent = nullptr;
 		info->m_costSoFar = 0;
 		info->m_totalCost = 0;

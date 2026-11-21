@@ -738,6 +738,9 @@ private:
 		NEVER EVER EVER set this directly. you must call setQueueForPathTime() in ALL CASES.
 	*/
 	UnsignedInt	m_queueForPathFrame;
+#if !RETAIL_COMPATIBLE_PATHFINDING
+	UnsignedByte m_consecutivePathFailures;				///< Exponential backoff counter to prevent repath storms when crowded.
+#endif
 	Coord3D			m_finalPosition;						///< Final position for the moveto states.
 	ObjectID		m_repulsor1;								///< First object we are running away from.
 	ObjectID		m_repulsor2;								///< Second object we are running away from.

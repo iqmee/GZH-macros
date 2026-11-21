@@ -40,6 +40,10 @@ protected:
 
 	PathfindCellInfo *m_nextOpen, *m_prevOpen;						///< for A* "open" list, shared by closed list
 
+#if !RETAIL_COMPATIBLE_PATHFINDING
+	Int m_heapIndex;												///< Index inside PathfindOpenHeap (-1 when not in open heap)
+#endif
+
 	PathfindCellInfo *m_pathParent;												///< "parent" cell from pathfinder
 	PathfindCell *m_cell;															///< Cell this info belongs to currently.
 
