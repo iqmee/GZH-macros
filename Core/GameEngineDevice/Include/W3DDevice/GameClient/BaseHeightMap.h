@@ -147,6 +147,7 @@ public:
 
 	/// Update the macro texture (pass 3).
 	void setTextureLOD(Int lod);	///<change the maximum mip-level sent to the hardware.
+	const AsciiString& getMacroTextureName() const { return m_macroTextureName; }
 	void updateMacroTexture(AsciiString textureName);
 	void doTextures(Bool flag) {m_disableTextures = !flag;};
 	/// Update the diffuse value from static light info for one vertex.

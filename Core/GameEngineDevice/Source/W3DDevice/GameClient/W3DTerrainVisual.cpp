@@ -30,8 +30,10 @@
 #include <stdlib.h>
 #include <windows.h>
 
+#include "Common/Dict.h"
 #include "Common/GameState.h"
 #include "Common/GlobalData.h"
+#include "Common/MapObject.h"
 #include "Common/PerfTimer.h"
 #include "Common/MapReaderWriterInfo.h"
 #include "Common/ThingTemplate.h"
@@ -622,6 +624,29 @@ Bool W3DTerrainVisual::load( AsciiString filename )
 																				 m_logicHeightMap->getDrawHeight(),
 																				 m_logicHeightMap,
 																				 it);
+#endif
+
+#if RTS_ZEROHOUR
+	{
+		AsciiString macroTexture;
+		const Dict *worldDict = MapObject::getWorldDict();
+		if (worldDict != nullptr)
+		{
+			// Look up macroTexture without allocating a new NameKey when absent, preserving retail CRC compatibility.
+			for (Int i = 0; i < worldDict->getPairCount(); ++i)
+			{
+				if (worldDict->getNthType(i) == Dict::DICT_ASCIISTRING)
+				{
+					if (TheNameKeyGenerator->keyToName(worldDict->getNthKey(i)).compareNoCase("macroTexture") == 0)
+					{
+						macroTexture = worldDict->getNthAsciiString(i);
+						break;
+					}
+				}
+			}
+		}
+		m_terrainRenderObject->updateMacroTexture(macroTexture);
+	}
 #endif
 
 

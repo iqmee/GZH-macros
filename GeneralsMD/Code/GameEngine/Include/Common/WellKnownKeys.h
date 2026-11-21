@@ -902,6 +902,13 @@ DEFINE_KEY(weather)
 DEFINE_KEY(mapName)
 DEFINE_KEY(compression)
 
+/**
+	Which: World Properties
+	Type: AsciiString
+	Usage: (optional) if present, filename of the terrain macrotexture in Art/Textures/. If missing or empty, uses default TSNoiseUrb.tga.
+*/
+DEFINE_KEY(macroTexture)
+
 
 // ---------------------------------------------------------------------------------------
 // well-known Waypoints.

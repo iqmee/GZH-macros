@@ -1318,6 +1318,11 @@ BOOL CWorldBuilderDoc::OnNewDocument()
 
 	Create3DView();
 
+	if (TheTerrainRenderObject != nullptr)
+	{
+		TheTerrainRenderObject->updateMacroTexture(AsciiString::TheEmptyString);
+	}
+
 	POSITION pos = GetFirstViewPosition();
 	while (pos != nullptr)
 	{
@@ -1434,6 +1439,18 @@ BOOL CWorldBuilderDoc::OnOpenDocument(LPCTSTR lpszPathName)
 		return FALSE;
 
 	Create3DView();
+
+	if (TheTerrainRenderObject != nullptr)
+	{
+		Bool exists = FALSE;
+		AsciiString macroTexture = MapObject::getWorldDict()->getAsciiString(TheKey_macroTexture, &exists);
+		TheTerrainRenderObject->updateMacroTexture(exists ? macroTexture : AsciiString::TheEmptyString);
+		WbView3d *p3View = Get3DView();
+		if (p3View != nullptr)
+		{
+			p3View->redraw();
+		}
+	}
 
 	return TRUE;
 }

@@ -21,6 +21,8 @@
 // SelectMacrotexture.h : header file
 //
 
+#include "Common/AsciiString.h"
+
 /////////////////////////////////////////////////////////////////////////////
 // SelectMacrotexture dialog
 
@@ -47,6 +49,10 @@ public:
 
 protected:
 	CTreeCtrl		m_textureTreeView;
+	AsciiString	m_initialMacroTexture;
+	AsciiString	m_selectedMacroTexture;
+	Bool				m_initialUseLightMap;
+	Bool				m_initializing;
 
 
 // Implementation
@@ -55,6 +61,8 @@ protected:
 	// Generated message map functions
 	//{{AFX_MSG(SelectMacrotexture)
 	virtual BOOL OnInitDialog() override;
+	virtual void OnOK() override;
+	virtual void OnCancel() override;
 	//}}AFX_MSG
 	DECLARE_MESSAGE_MAP()
 };

@@ -86,6 +86,7 @@
 #include "WW3D2/Renderer.h"
 #include "WW3D2/light.h"
 #include "WW3D2/scene.h"
+#include "WWLib/ffactory.h"
 #include "W3DDevice/GameClient/W3DPoly.h"
 #include "W3DDevice/GameClient/W3DCustomScene.h"
 
@@ -376,6 +377,9 @@ void BaseHeightMapRenderObjClass::adjustTerrainLOD(Int adj)
 																					 m_map->getDrawHeight(),
 																					 m_map,
 																					 nullptr);
+		if (newROBJ != this) {
+			newROBJ->updateMacroTexture(m_macroTextureName);
+		}
 		TheTerrainRenderObject = newROBJ;
 		newROBJ->staticLightingChanged();
 		newROBJ->m_roadBuffer->loadRoads();
@@ -611,6 +615,36 @@ void BaseHeightMapRenderObjClass::doTheLight(VERTEX_FORMAT *vb, const Vector3*li
 #endif
 }
 
+static Bool doesMacroTextureExist(const AsciiString& textureName)
+{
+	if (textureName.isEmpty() || _TheFileFactory == nullptr)
+	{
+		return FALSE;
+	}
+
+	{
+		file_auto_ptr file(_TheFileFactory, textureName.str());
+		if (file.get() != nullptr && file->Is_Available())
+		{
+			return TRUE;
+		}
+	}
+
+	if (textureName.endsWithNoCase(".tga"))
+	{
+		AsciiString ddsName = textureName;
+		ddsName.truncateBy(3);
+		ddsName.concat("dds");
+		file_auto_ptr ddsFile(_TheFileFactory, ddsName.str());
+		if (ddsFile.get() != nullptr && ddsFile->Is_Available())
+		{
+			return TRUE;
+		}
+	}
+
+	return FALSE;
+}
+
 //=============================================================================
 // BaseHeightMapRenderObjClass::updateMacroTexture
 //=============================================================================
@@ -618,20 +652,43 @@ void BaseHeightMapRenderObjClass::doTheLight(VERTEX_FORMAT *vb, const Vector3*li
 //=============================================================================
 void BaseHeightMapRenderObjClass::updateMacroTexture(AsciiString textureName)
 {
-	m_macroTextureName = textureName;
+	AsciiString resolvedName = textureName;
+	if (!resolvedName.isEmpty() && !doesMacroTextureExist(resolvedName))
+	{
+		DEBUG_LOG(("BaseHeightMapRenderObjClass::updateMacroTexture - Macrotexture '%s' not found; falling back to default.", resolvedName.str()));
+		resolvedName.clear();
+	}
+
+	if (TheGlobalData && TheGlobalData->m_headless)
+	{
+		m_macroTextureName = resolvedName;
+		return;
+	}
+
+	if (m_stageThreeTexture != nullptr && m_macroTextureName.compareNoCase(resolvedName) == 0)
+	{
+		return;
+	}
+
+	m_macroTextureName = resolvedName;
 	// Release texture.
 	REF_PTR_RELEASE(m_stageThreeTexture);
 	// Reallocate texture.
-	m_stageThreeTexture=NEW LightMapTerrainTextureClass(m_macroTextureName);
+	m_stageThreeTexture = NEW LightMapTerrainTextureClass(m_macroTextureName);
 }
 
 //=============================================================================
 // BaseHeightMapRenderObjClass::reset
 //=============================================================================
-/** Updates the macro noise/lightmap texture (pass 3) */
+/** Resets map-specific render buffers and restores the default macrotexture. */
 //=============================================================================
 void BaseHeightMapRenderObjClass::reset()
 {
+	if (!m_macroTextureName.isEmpty())
+	{
+		updateMacroTexture(AsciiString::TheEmptyString);
+	}
+
 	if (m_treeBuffer) {
 		m_treeBuffer->clearAllTrees();
 	}
