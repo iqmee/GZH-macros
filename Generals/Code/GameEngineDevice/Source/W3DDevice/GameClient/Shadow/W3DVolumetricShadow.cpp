@@ -36,6 +36,8 @@
 
 // SYSTEM INCLUDES ////////////////////////////////////////////////////////////
 #include <assert.h>
+#include <cstddef>
+#include <vector>
 
 // USER INCLUDES //////////////////////////////////////////////////////////////
 #include "WWLib/always.h"
@@ -46,6 +48,7 @@
 #include "WW3D2/hlod.h"
 #include "WW3D2/mesh.h"
 #include "WW3D2/meshmdl.h"
+#include "WW3D2/w3d_lossless_opt.h"
 #include "Lib/BaseType.h"
 #include "W3DDevice/GameClient/HeightMap.h"
 #include "d3dx8math.h"
@@ -109,8 +112,8 @@ int nShadowVertsInBuf=0;	//model vetices in vertex buffer
 int nShadowStartBatchVertex=0;
 int nShadowIndicesInBuf=0;	//model vetices in vertex buffer
 int nShadowStartBatchIndex=0;
-int SHADOW_VERTEX_SIZE=4096;
-int SHADOW_INDEX_SIZE=8192;
+int SHADOW_VERTEX_SIZE=32768;
+int SHADOW_INDEX_SIZE=65532;
 
 //Rough bounding box around visible portion of the terrain
 //useful for quick culling
@@ -176,7 +179,7 @@ struct Geometry
 		*psIndexList++ = m_indices[dwPolyId*3+2];
 		return &m_indices[dwPolyId];
 	}
-	Int SetPolygonIndex (long dwPolyId, short *psIndexList, int dwNSize)
+	Int SetPolygonIndex (long dwPolyId, const UnsignedShort *psIndexList, int dwNSize)
 	{
 		m_indices[dwPolyId*3]=psIndexList[0];
 		m_indices[dwPolyId*3+1]=psIndexList[1];
@@ -235,25 +238,13 @@ const Byte POLY_PROCESSED = 0x02;  // this poly has been processed
 // STRUCT /////////////////////////////////////////////////////////////////////
 
 // NeighborEdge ---------------------------------------------------------------
-typedef struct _NeighborEdge
-{
-
-	Short neighborIndex;  // index of polygon who is our neighbor, if there is
-												// not a neighbor it contains NO_NEIGHBOR
-	Short neighborEdgeIndex[ 2 ];  // the two vertex indices that represent the
-																 // shared edge
-
-} NeighborEdge;
+using NeighborEdge = W3DLosslessOpt::ShadowPolyNeighborEdge;
 
 // PolygonNeighbor ------------------------------------------------------------
-struct  PolyNeighbor
+struct PolyNeighbor : public W3DLosslessOpt::ShadowPolyNeighbor
 {
-
-	Short myIndex;  // our polygon index so we know who we are
-	Byte status;  // status flags used when processing neighbors
-	NeighborEdge neighbor[ MAX_POLYGON_NEIGHBORS ];
-
 };
+static_assert(sizeof(PolyNeighbor) == sizeof(W3DLosslessOpt::ShadowPolyNeighbor), "PolyNeighbor layout must match ShadowPolyNeighbor");
 
 /**This class holds original mesh specific data and geometry.  The meshes stored in this
 class have been cleaned to remove replicated vertices and also cache mesh data needed for
@@ -274,7 +265,7 @@ public:
 	{
 		if (m_polygonNormals)
 			return &(*pvNorm=m_polygonNormals[dwPolyNormId]);
-		short indexList[3];
+		Int indexList[3];
 		Vector3 vertexList[3];
 		//get vertex indices for this polygon
 		GetPolygonIndex(dwPolyNormId,indexList,3);
@@ -319,7 +310,7 @@ protected:
 	PolyNeighbor *GetPolyNeighbor( Int polyIndex );
 	int GetNumVertex ()	{	return m_numVerts;}
 	///Get indices to the 3 vertices of this face.
-	virtual int GetPolygonIndex (long dwPolyId, short *psIndexList, int dwNSize) const
+	virtual int GetPolygonIndex (long dwPolyId, Int *psIndexList, int dwNSize) const
 	{	const TriIndex *polyi=&m_polygons[dwPolyId];
 		*psIndexList++ = m_parentVerts[polyi->I];
 		*psIndexList++ = m_parentVerts[polyi->J];
@@ -599,16 +590,12 @@ class W3DShadowGeometry : public RefCountClass, public	HashableClass
 		Int m_numTotalsVerts;						///<number of verts in entire hierarchy
 };
 
-#define MAX_SHADOW_VOLUME_VERTS 16384
+#define MAX_SHADOW_VOLUME_VERTS 65535
 
 Int W3DShadowGeometry::initFromHLOD(RenderObjClass *robj)
 {
 	HLodClass *hlod=(HLodClass *)robj;
-	//locations of parent vertices inside the vertex array after duplicate
-	//vertices are removed.
-	UnsignedShort vertParent[MAX_SHADOW_VOLUME_VERTS];
-
-	Int i,j,k,newVertexCount;
+	Int i,newVertexCount;
 
 	Int top = hlod->Get_LOD_Count()-1;
 	W3DShadowGeometryMesh *geomMesh=&m_meshList[m_meshCount];
@@ -636,31 +623,12 @@ Int W3DShadowGeometry::initFromHLOD(RenderObjClass *robj)
 			if (geomMesh->m_numVerts > MAX_SHADOW_VOLUME_VERTS)
 				return FALSE;	//too many vertices to process
 
-			//reset index of all vertices
-			memset(vertParent,0xffffffff,sizeof(vertParent));
-			newVertexCount=geomMesh->m_numVerts;
-			//Find all duplicated vertices.
-			for (j=0; j<geomMesh->m_numVerts; j++)
-			{
-				if (vertParent[j] != 0xffff)
-					continue;	//this vertex has already been processed
-
-				const Vector3 *v_curr=&geomMesh->m_verts[j];
-
-				for (k=j+1; k<geomMesh->m_numVerts; k++)
-				{
-					Vector3 len(*v_curr - geomMesh->m_verts[k]);
-					if (len.Length2() == 0)
-					{
-						//found duplicate vertex
-						vertParent[k]=j;
-						newVertexCount--;	//decrease total vertices since duplicate found.
-					}
-				}
-				vertParent[j]=j;	//first instance of new vertex
-			}
+			// Exact O(V) bit-identical duplicate-vertex welding (zero geometry distortion)
 			geomMesh->m_parentVerts = NEW UnsignedShort[geomMesh->m_numVerts];
-			memcpy(geomMesh->m_parentVerts,vertParent,sizeof(UnsignedShort)*geomMesh->m_numVerts);
+			newVertexCount = W3DLosslessOpt::WeldVerticesExact(
+				geomMesh->m_verts,
+				geomMesh->m_numVerts,
+				geomMesh->m_parentVerts);
 			geomMesh->m_numVerts=newVertexCount;	//adjust actual vertex count to ignore duplicates
 			m_numTotalsVerts += newVertexCount;
 			geomMesh->m_parentGeometry = this;
@@ -682,11 +650,7 @@ Int W3DShadowGeometry::initFromHLOD(RenderObjClass *robj)
 
 Int W3DShadowGeometry::initFromMesh(RenderObjClass *robj)
 {
-	//locations of parent vertices inside the vertex array after duplicate
-	//vertices are removed.
-	UnsignedShort vertParent[MAX_SHADOW_VOLUME_VERTS];
-
-	Int j,k,newVertexCount;
+	Int newVertexCount;
 	W3DShadowGeometryMesh *geomMesh=&m_meshList[m_meshCount];
 
 	assert (m_meshCount < MAX_SHADOW_CASTER_MESHES);
@@ -705,32 +669,12 @@ Int W3DShadowGeometry::initFromMesh(RenderObjClass *robj)
 	if (geomMesh->m_numVerts > MAX_SHADOW_VOLUME_VERTS)
 		return FALSE;	//too many vertices to process
 
-	//reset index of all vertices
-	memset(vertParent,0xffffffff,sizeof(vertParent));
-	newVertexCount=geomMesh->m_numVerts;
-	//Find all duplicated vertices.
-	for (j=0; j<geomMesh->m_numVerts; j++)
-	{
-		if (vertParent[j] != 0xffff)
-			continue;	//this vertex has already been processed
-
-		const Vector3 *v_curr=&geomMesh->m_verts[j];
-
-		for (k=j+1; k<geomMesh->m_numVerts; k++)
-		{
-			Vector3 len(*v_curr - geomMesh->m_verts[k]);
-			if (len.Length2() == 0)
-			{
-				//found duplicate vertex
-				vertParent[k]=j;
-				newVertexCount--;	//decrease total vertices since duplicate found.
-			}
-		}
-		vertParent[j]=j;	//first instance of new vertex
-	}
-
+	// Exact O(V) bit-identical duplicate-vertex welding (zero geometry distortion)
 	geomMesh->m_parentVerts = NEW UnsignedShort[geomMesh->m_numVerts];
-	memcpy(geomMesh->m_parentVerts,vertParent,sizeof(UnsignedShort)*geomMesh->m_numVerts);
+	newVertexCount = W3DLosslessOpt::WeldVerticesExact(
+		geomMesh->m_verts,
+		geomMesh->m_numVerts,
+		geomMesh->m_parentVerts);
 	geomMesh->m_numVerts=newVertexCount;	//adjust actual vertex count to ignore duplicates
 	geomMesh->m_parentGeometry = this;
 
@@ -780,6 +724,10 @@ W3DShadowGeometryMesh::~W3DShadowGeometryMesh()
 // ============================================================================
 PolyNeighbor *W3DShadowGeometryMesh::GetPolyNeighbor( Int polyIndex )
 {
+	if (!m_polyNeighbors)
+	{
+		buildPolygonNeighbors();
+	}
 
 	// sanity
 	if( polyIndex < 0 || polyIndex >= m_numPolyNeighbors )
@@ -803,7 +751,7 @@ PolyNeighbor *W3DShadowGeometryMesh::GetPolyNeighbor( Int polyIndex )
 void W3DShadowGeometryMesh::buildPolygonNeighbors()
 {
 	Int numPolys;
-	Int i, j;
+	buildPolygonNormals();
 
 	// how many polygons are in our geometry
 	numPolys = GetNumPolygon();
@@ -845,143 +793,14 @@ void W3DShadowGeometryMesh::buildPolygonNeighbors()
 
 	}
 
-	//
-	// initialize all polygon neighbor information to none and assign our
-	// own reference to myIndex so we know who we are
-	//
-	for( i = 0; i < m_numPolyNeighbors; i++ )
-	{
-
-		// assign our own identification
-		m_polyNeighbors[ i ].myIndex = i;
-
-		// assign our neighbors to none
-		for( j = 0; j < MAX_POLYGON_NEIGHBORS; j++ )
-			m_polyNeighbors[ i ].neighbor[ j ].neighborIndex = NO_NEIGHBOR;
-
-	}
-
-	// assign polygon data for each of our polygons
-	for( i = 0; i < m_numPolyNeighbors; i++ )
-	{
-		Short poly[ 3 ];  // vertex indices for this polygon
-		Short otherPoly[ 3 ];  // vertex indices for other polygon
-		Vector3 vNorm;
-
-		// get the indices of the three triangle points for this polygon
-		GetPolygonIndex( i, poly, 3 );
-		GetPolygonNormal(i,&vNorm);
-
-		// find the neighbors of this polygon
-		for( j = 0; j < m_numPolyNeighbors; j++ )
-		{
-			Int a, b;
-			Int index1, index2;
-			Int index1Pos[2]; //positions of shared edge vertices in triangle list. (0,1 or 2)
-			Int diff1,diff2;
-
-			// ignore our own polygon
-			if( i == j )
-				continue;
-
-			// get the vertex index information for this other polygon
-			GetPolygonIndex( j, otherPoly, 3 );
-
-			//
-			// if 2 of the 3 vertex indices are the same then these polygons
-			// are neighbors
-			//
-			//Also check if winding order of vertices on edge is opposite.
-			//If vertices are in same order as our polygon, then it's
-			//not a valid edge because the neighbor is flipped.
-
-			index1 = -1;
-			index2 = -1;
-			for( a = 0; a < 3; a++ )
-				for( b = 0; b < 3; b++ )
-					if( poly[ a ] == otherPoly[ b ] )
-					{
-
-						if( index1 == -1 )
-						{	index1 = poly[ a ];  // record matching index1
-							index1Pos[0]=a;
-							index1Pos[1]=b;
-						}
-						else if( index2 == -1 )
-						{
-							//Check direction of edge in each polygon.  If they are same direction skip it.
-							diff1 = a-index1Pos[0];
-							diff2 = b-index1Pos[1];
-							if ( ((diff1&0x80000000)^((abs(diff1)&2)<<30)) != ((diff2&0x80000000)^((abs(diff2)&2)<<30)))
-							{	Vector3 vOtherNorm;
-
-								GetPolygonNormal(j,&vOtherNorm);
-
-								//Check if the 2 polygons face in exactly opposite directions - don't allow this type of neighbor.
-								if (fabs(Vector3::Dot_Product(vOtherNorm,vNorm) + 1.0f) <= 0.01f)
-									continue;
-
-								index2 = poly[ a ];  // record matching index2
-							}
-							else
-								continue;
-						}
-						else
-						{
-							//This is the same poly facing opposite direction.	//assert( 0 );  // should never match 3 vertices!
-							index1=index2=-1;
-							continue;
-						}
-					}
-			if( index1 != -1 && index2 != -1  )
-			{
-				//
-				// the polygon j is a neighbor of our polygon i, put the j
-				// index into the first free neighbor slot for polygon i
-				//
-				for( a = 0; a < MAX_POLYGON_NEIGHBORS; a++ )
-					if( m_polyNeighbors[ i ].neighbor[ a ].neighborIndex == NO_NEIGHBOR )
-					{
-
-						// record the neighbor index
-						m_polyNeighbors[ i ].neighbor[ a ].neighborIndex = j;
-
-						// record the sharded edge vertex indices
-						m_polyNeighbors[ i ].neighbor[ a ].neighborEdgeIndex[ 0 ] = index1;
-						m_polyNeighbors[ i ].neighbor[ a ].neighborEdgeIndex[ 1 ] = index2;
-
-						break;  // exit for a
-
-					}
-
-				//
-				// error condition, if our counter a is at the max number
-				// of neighbors, which is 3 for a triangle mesh, we did something
-				// wrong here because that would mean we found a 4th match!
-				//
-				if (a == MAX_POLYGON_NEIGHBORS)
-				{
-					Vector3 pv[3];
-//					char errorText[255];
-
-					GetVertex (poly[0], &pv[0]);
-					GetVertex (poly[1], &pv[1]);
-					GetVertex (poly[2], &pv[2]);
-
-					pv[0] = pv[0] + pv[1] + pv[2];
-					pv[0] /= 3.0f;	//find center of polygon
-
-//					sprintf(errorText,"%s: Shadow Polygon with too many neighbors at %f,%f,%f",m_parentGeometry->Get_Name(),pv[0].X,pv[0].Y,pv[0].Z);
-//					DEBUG_LOG(("****%s Shadow Polygon with too many neighbors at %f,%f,%f",m_parentGeometry->Get_Name(),pv[0].X,pv[0].Y,pv[0].Z));
-//					DEBUG_ASSERTCRASH(a != MAX_POLYGON_NEIGHBORS,(errorText));
-				}
-
-			}
-
-		}
-
-	}
-
+	// Exact O(P) directed half-edge hash neighbor builder (bit-identical to legacy O(P^2) loop).
+	static_assert(sizeof(TriIndex) == 3 * sizeof(uint16_t), "TriIndex must be tightly packed 3x uint16_t");
+	W3DLosslessOpt::BuildPolygonNeighborsExact(
+		m_numPolyNeighbors,
+		&m_polygons[0].I,
+		m_parentVerts,
+		m_polygonNormals,
+		m_polyNeighbors);
 }
 
 // allocateNeighbors ==========================================================
@@ -1311,8 +1130,8 @@ void W3DVolumetricShadow::RenderDynamicMeshVolume(Int meshIndex, Int lightIndex,
 	numPolys = geometry->GetNumActivePolygon();
 	numIndex = numPolys * 3;
 
-	// reject shadows with no data
-	if( numVerts == 0 || numPolys == 0 )
+	// reject shadows with no data or exceeding dynamic buffer capacity
+	if( numVerts == 0 || numPolys == 0 || numVerts > SHADOW_VERTEX_SIZE || numIndex > SHADOW_INDEX_SIZE )
 		return;
 
 
@@ -1615,8 +1434,8 @@ W3DVolumetricShadow::~W3DVolumetricShadow()
 void W3DVolumetricShadow::SetGeometry( W3DShadowGeometry *geometry )
 {
 
-	Short numPrevVertices = 0;
-	Short numNewVertices = 0;
+	Int numPrevVertices = 0;
+	Int numNewVertices = 0;
 
 	//
 	// our geometry has changed, we need to allocate enough memory for the
@@ -1746,8 +1565,8 @@ void W3DVolumetricShadow::updateVolumes(Real zoffset)
 
 	HLodClass *hlod=(HLodClass *)m_robj;
 	MeshClass *mesh;
-	static AABoxClass aaBox;
-	static SphereClass sphere;
+	AABoxClass aaBox;
+	SphereClass sphere;
 	Int meshIndex;
 
 	DEBUG_ASSERTCRASH(hlod != nullptr,("updateVolumes : hlod is null!"));
@@ -2000,20 +1819,14 @@ void W3DVolumetricShadow::updateMeshVolume(Int meshIndex, Int lightIndex, const 
 
 		if (result != CollisionMath::OUTSIDE)
 		{
-			//
-			// reset the silhouette data and build a new one from this light
-			// source perspective
-			//
-
-			if (m_numSilhouetteIndices[meshIndex] != 0)
+			// Ensure shared face normals and neighbor topology are built once on the main thread
+			// so worker threads only read immutable shared W3DShadowGeometryMesh data.
+			W3DShadowGeometryMesh *geomMesh = m_geometry->getMesh(meshIndex);
+			geomMesh->buildPolygonNormals();
+			if (geomMesh->GetNumPolygon() > 0)
 			{
-				//this silhouette was built before and is being updated.
-				//this probably means it will change again in the future.
-				//make future updates faster by pre-caching face normals.
-				m_geometry->getMesh(meshIndex)->buildPolygonNormals();
+				geomMesh->GetPolyNeighbor(0);
 			}
-			resetSilhouette(meshIndex);
-			buildSilhouette(meshIndex, &lightPosObject);
 
 			//
 			// in a multiple shadow situation we would be allocating a volume
@@ -2040,27 +1853,50 @@ void W3DVolumetricShadow::updateMeshVolume(Int meshIndex, Int lightIndex, const 
 				}
 			}
 
-			//
-			// construct the shadow volume at this light position in the
-			// passed shadow volume geometry index
-			//
-			if (m_shadowVolume[ lightIndex ][meshIndex]->GetFlags() & SHADOW_DYNAMIC)
-				constructVolume( &lightPosObject, vectorScaleMax, lightIndex, meshIndex );
-			else
-				constructVolumeVB( &lightPosObject, vectorScaleMax, lightIndex, meshIndex );
+			if (m_shadowVolume[ lightIndex ][meshIndex])
+			{
+				// Dynamic CPU-only shadow volume builds are batched for multi-core execution during renderShadows().
+				if ((m_shadowVolume[ lightIndex ][meshIndex]->GetFlags() & SHADOW_DYNAMIC) &&
+					lightIndex == 0 &&
+					m_silhouetteIndex[meshIndex] != nullptr &&
+					TheW3DVolumetricShadowManager != nullptr &&
+					TheW3DVolumetricShadowManager->isDeferringDynamicBuilds())
+				{
+					TheW3DVolumetricShadowManager->enqueueDynamicShadowBuild(
+						this, meshIndex, lightIndex, lightPosObject, vectorScaleMax);
+				}
+				else
+				{
+					//
+					// reset the silhouette data and build a new one from this light
+					// source perspective
+					//
+					resetSilhouette(meshIndex);
+					buildSilhouette(meshIndex, &lightPosObject);
 
-			//
-			// store the current light position and orientation that
-			// we constructed shadow info at
-			//
-			m_objectXformHistory[ lightIndex ][meshIndex] = objectToWorld;
-			m_lightPosHistory[lightIndex][meshIndex] = lightPosWorld;
+					//
+					// construct the shadow volume at this light position in the
+					// passed shadow volume geometry index
+					//
+					if (m_shadowVolume[ lightIndex ][meshIndex]->GetFlags() & SHADOW_DYNAMIC)
+						constructVolume( &lightPosObject, vectorScaleMax, lightIndex, meshIndex );
+					else
+						constructVolumeVB( &lightPosObject, vectorScaleMax, lightIndex, meshIndex );
+				}
 
-			box.Translate(-objectCenter);	//translate box to object space.
-			m_shadowVolume[ lightIndex ][meshIndex]->setBoundingBox(box);
-			sphere.Center -= objectCenter;
-			m_shadowVolume[ lightIndex ][meshIndex]->setBoundingSphere(sphere);
-			m_shadowVolume[ lightIndex ][meshIndex]->setVisibleState(Geometry::STATE_VISIBLE);	//this volume needs rendering.
+				//
+				// store the current light position and orientation that
+				// we constructed shadow info at
+				//
+				m_objectXformHistory[ lightIndex ][meshIndex] = objectToWorld;
+				m_lightPosHistory[lightIndex][meshIndex] = lightPosWorld;
+
+				box.Translate(-objectCenter);	//translate box to object space.
+				m_shadowVolume[ lightIndex ][meshIndex]->setBoundingBox(box);
+				sphere.Center -= objectCenter;
+				m_shadowVolume[ lightIndex ][meshIndex]->setBoundingSphere(sphere);
+				m_shadowVolume[ lightIndex ][meshIndex]->setVisibleState(Geometry::STATE_VISIBLE);	//this volume needs rendering.
+			}
 		}
 		else
 		if (m_shadowVolume[ lightIndex ][meshIndex])
@@ -2081,6 +1917,14 @@ void W3DVolumetricShadow::updateMeshVolume(Int meshIndex, Int lightIndex, const 
 	}
 }
 
+void W3DVolumetricShadow::buildDynamicMeshVolumeJob(Int meshIndex, Int lightIndex, const Vector3 &lightPosObject, Real shadowExtrudeDistance)
+{
+	Vector3 lightPosLocal = lightPosObject;
+	resetSilhouette(meshIndex);
+	buildSilhouette(meshIndex, &lightPosLocal);
+	constructVolume(&lightPosLocal, shadowExtrudeDistance, lightIndex, meshIndex);
+}
+
 // addSilhouetteEdge ==========================================================
 // It has been determined that the polygon neighbor in the "neighborIndex"
 // of "visible" needs to be added to the silhouette.  We will add those two
@@ -2091,8 +1935,8 @@ void W3DVolumetricShadow::addSilhouetteEdge(Int meshIndex, PolyNeighbor *visible
 {
 	Int i;
 	Int neighborIndex = 0;
-	Short visibleIndexList[ 3 ];
-	Short edgeStart, edgeEnd;
+	Int visibleIndexList[ 3 ];
+	Int edgeStart, edgeEnd;
 
 	W3DShadowGeometryMesh *geomMesh=m_geometry->getMesh(meshIndex);
 
@@ -2175,9 +2019,9 @@ void W3DVolumetricShadow::addSilhouetteEdge(Int meshIndex, PolyNeighbor *visible
 // ============================================================================
 void W3DVolumetricShadow::addNeighborlessEdges(Int meshIndex, PolyNeighbor *us )
 {
-	Short vertexIndexList[ 3 ];
+	Int vertexIndexList[ 3 ];
 	Int i, j;
-	Short edgeStart, edgeEnd;
+	Int edgeStart, edgeEnd;
 	Bool addEdge;
 
 	// sanity
@@ -2240,11 +2084,15 @@ void W3DVolumetricShadow::addNeighborlessEdges(Int meshIndex, PolyNeighbor *us )
 // addSilhouetteIndices =======================================================
 // Add these two indices to the silhouette data
 // ============================================================================
-void W3DVolumetricShadow::addSilhouetteIndices(Int meshIndex, Short edgeStart, Short edgeEnd )
+void W3DVolumetricShadow::addSilhouetteIndices(Int meshIndex, Int edgeStart, Int edgeEnd )
 {
 
 //	DBGPRINTF(( "addSilhouetteIndices: Adding (%d,%d), the storage before the add is = (%d/%d)\n",
 //							edgeStart, edgeEnd, m_numSilhouetteIndices, m_maxSilhouetteEntries ));
+
+	// Bounds guard against pathological open meshes
+	if (m_numSilhouetteIndices[meshIndex] + 2 > m_maxSilhouetteEntries[meshIndex])
+		return;
 
 	// add to silhouette edge list
 	assert( m_numSilhouetteIndices[meshIndex] < m_maxSilhouetteEntries[meshIndex] );
@@ -2280,16 +2128,23 @@ void W3DVolumetricShadow::buildSilhouette(Int meshIndex, Vector3 *lightPosObject
 	meshEdgeStart=m_numSilhouetteIndices[meshIndex];
 
 	numPolys = geomMesh->GetNumPolygon();
+	if (numPolys <= 0)
+	{
+		m_numIndicesPerMesh[meshIndex] = 0;
+		return;
+	}
+
+	// Thread-local status buffer ensures shared W3DShadowGeometryMesh::m_polyNeighbors
+	// is strictly read-only during parallel dynamic shadow silhouette construction.
+	thread_local std::vector<UnsignedByte> polyStatus;
+	polyStatus.assign(static_cast<size_t>(numPolys), 0);
+
+	geomMesh->GetPolyNeighbor(0);
+
 	for( i = 0; i < numPolys; i++ )
 	{
-		Short poly[ 3 ];
+		Int poly[ 3 ];
 		Vector3 vertex;
-
-		// get this polygon neighbor information
-		polyNeighbor = geomMesh->GetPolyNeighbor( i );
-
-		// take this opportunity to initialize our processing flags to zero
-		polyNeighbor->status = 0;
 
 		// get the normal for this polygon
 		geomMesh->GetPolygonNormal( i, &normal );
@@ -2315,7 +2170,7 @@ void W3DVolumetricShadow::buildSilhouette(Int meshIndex, Vector3 *lightPosObject
 		// poly is visible from this location
 		//
 		if( Vector3::Dot_Product( lightVector, normal ) < 0.0f )
-			BitSet( polyNeighbor->status, POLY_VISIBLE );
+			BitSet( polyStatus[i], POLY_VISIBLE );
 
 	}
 
@@ -2334,27 +2189,28 @@ void W3DVolumetricShadow::buildSilhouette(Int meshIndex, Vector3 *lightPosObject
 		// initialize ourselves to not be a visible edge
 		visibleNeighborless = FALSE;
 
+		const Bool usVisible = BitIsSet( polyStatus[i], POLY_VISIBLE ) != 0;
+
 		// check our 3 potential neighbors
 		for( j = 0; j < MAX_POLYGON_NEIGHBORS; j++ )
 		{
 
 			// initialize this neighbor to nuttin
 			otherNeighbor = nullptr;
+			const Int otherIndex = polyNeighbor->neighbor[ j ].neighborIndex;
 
 			// get our neighbor if present and cull them if processed
-			if( polyNeighbor->neighbor[ j ].neighborIndex != NO_NEIGHBOR )
+			if( otherIndex != NO_NEIGHBOR )
 			{
 
 				// get the jth polygon neighbor ... this is "them"
-				otherNeighbor =
-					geomMesh->GetPolyNeighbor(
-						polyNeighbor->neighbor[ j ].neighborIndex );
+				otherNeighbor = geomMesh->GetPolyNeighbor( otherIndex );
 
 				//
 				// ignore neighbors that are marked as processed as those
 				// ones have already detected edges if present
 				//
-				if( BitIsSet( otherNeighbor->status, POLY_PROCESSED ) )
+				if( BitIsSet( polyStatus[otherIndex], POLY_PROCESSED ) )
 					continue;  // for j
 
 			}
@@ -2367,7 +2223,7 @@ void W3DVolumetricShadow::buildSilhouette(Int meshIndex, Vector3 *lightPosObject
 			// if we have no neighbor we just record the fact that we have
 			// real model end edges to add after this inner j loop;
 			//
-			if( BitIsSet( polyNeighbor->status, POLY_VISIBLE ) )
+			if( usVisible )
 			{
 
 				// check for no neighbor edges
@@ -2377,7 +2233,7 @@ void W3DVolumetricShadow::buildSilhouette(Int meshIndex, Vector3 *lightPosObject
 					visibleNeighborless = TRUE;
 
 				}
-				else if( BitIsSet( otherNeighbor->status, POLY_VISIBLE ) == FALSE )
+				else if( BitIsSet( polyStatus[otherIndex], POLY_VISIBLE ) == FALSE )
 				{
 
 					// "we" are visible and "they" are not
@@ -2387,7 +2243,7 @@ void W3DVolumetricShadow::buildSilhouette(Int meshIndex, Vector3 *lightPosObject
 
 			}
 			else if( otherNeighbor != nullptr &&
-							 BitIsSet( otherNeighbor->status, POLY_VISIBLE ) )
+							 BitIsSet( polyStatus[otherIndex], POLY_VISIBLE ) )
 			{
 
 				// "they" are visible and "we" are not
@@ -2413,7 +2269,7 @@ void W3DVolumetricShadow::buildSilhouette(Int meshIndex, Vector3 *lightPosObject
 		// polygons that reference back to this one can ignore their
 		// processing cause any edges were already detected
 		//
-		BitSet( polyNeighbor->status, POLY_PROCESSED );
+		BitSet( polyStatus[i], POLY_PROCESSED );
 
 	}
 
@@ -2444,8 +2300,8 @@ void W3DVolumetricShadow::constructVolume( Vector3 *lightPosObject,Real shadowEx
 	Geometry *shadowVolume;
 	Vector3 extrude2;  // the polypoints extruded from edge and light
 	Vector3 edgeVertex2;  // second edge of silhouette
-	Short indexList[ 3 ];
-	Int i,k;
+	UnsignedShort indexList[ 3 ];
+	Int i;
 	Int vertexCount;
 	Int polygonCount;
 	Int indicesPerMesh;
@@ -2474,6 +2330,9 @@ void W3DVolumetricShadow::constructVolume( Vector3 *lightPosObject,Real shadowEx
 
 	}
 
+	shadowVolume->SetNumActivePolygon(0);
+	shadowVolume->SetNumActiveVertex(0);
+
 	// step through each of the silhouette pairs
 	vertexCount = 0;
 	polygonCount = 0;
@@ -2482,10 +2341,12 @@ void W3DVolumetricShadow::constructVolume( Vector3 *lightPosObject,Real shadowEx
 	if (!indicesPerMesh)
 		return;	//nothing to draw
 
-	geomMesh = m_geometry->getMesh(meshIndex);
+	const Int maxVerts = (shadowVolume->GetNumVertex() < 65535) ? shadowVolume->GetNumVertex() : 65535;
+	const Int maxPolys = shadowVolume->GetNumPolygon();
+	if (maxVerts < 2 || maxPolys < 2)
+		return;
 
-	shadowVolume->SetNumActivePolygon(0);
-	shadowVolume->SetNumActiveVertex(0);
+	geomMesh = m_geometry->getMesh(meshIndex);
 
 #ifdef RECORD_SHADOW_STRIP_STATS
 	Int numStrips=0;	//keeps track of number of strips generated.
@@ -2493,11 +2354,14 @@ void W3DVolumetricShadow::constructVolume( Vector3 *lightPosObject,Real shadowEx
 	Int maxStripLength=0;	//keeps track of longest strip generated.
 #endif
 
-	Short *silhouetteIndices=m_silhouetteIndex[meshIndex];
+	Int *silhouetteIndices=m_silhouetteIndex[meshIndex];
+
+	// Exact O(E) silhouette edge chaining (replaces legacy O(E^2) nested scan)
+	W3DLosslessOpt::ChainSilhouetteEdgesExact(silhouetteIndices, indicesPerMesh);
 
 	//Initialize first strip info
-	Short stripStartIndex=silhouetteIndices[ 0 ];
-	Short stripStartVertex=0;
+	Int stripStartIndex=silhouetteIndices[ 0 ];
+	Int stripStartVertex=0;
 
 	//Insert the first vertex and extrusion into strip.
 	// get edge point
@@ -2517,21 +2381,16 @@ void W3DVolumetricShadow::constructVolume( Vector3 *lightPosObject,Real shadowEx
 
 	for( i = 0; i < indicesPerMesh; i += 2 )
 	{
-		Short currentEdgeEnd=silhouetteIndices[i+1];
+		Int currentEdgeEnd=silhouetteIndices[i+1];
 
-		//look for edge connected to this one and move it next to this edge
-		//in index list.  Rendering edges back-to-back improves vertex cache usage.
-		for (k=i+2; k<indicesPerMesh; k+=2)
-			if (silhouetteIndices[k]==currentEdgeEnd)
-			{
-				//swap the two edges
-				std::swap(silhouetteIndices[i+2], silhouetteIndices[k]);
-				std::swap(silhouetteIndices[i+3], silhouetteIndices[k+1]);
-				break;
-			}
+		// Edges are pre-chained in O(E); consecutive connected edge is directly at i+2.
+		const Bool hasNextConnected = ((i + 2) < indicesPerMesh && silhouetteIndices[i + 2] == currentEdgeEnd);
 
-		if (k >= indicesPerMesh)
+		if (!hasNextConnected)
 		{
+			if (polygonCount + 2 > maxPolys)
+				break;
+
 			//reached end of strip. Insert final edge.
 			//Check if last edge wraps around to start.
 			if (currentEdgeEnd == stripStartIndex)
@@ -2541,18 +2400,21 @@ void W3DVolumetricShadow::constructVolume( Vector3 *lightPosObject,Real shadowEx
 				// add the polygon consisting of the two edge vertices and the
 				// first extruded point
 				//
-				indexList[ 0 ] = lastEdgeVertex2Index;  // lastedgeVertex2 index
-				indexList[ 1 ] = lastExtrude2Index;  // lastextrude2 index
-				indexList[ 2 ] = stripStartVertex;  // edgeVertex2 index
+				indexList[ 0 ] = static_cast<UnsignedShort>(lastEdgeVertex2Index);  // lastedgeVertex2 index
+				indexList[ 1 ] = static_cast<UnsignedShort>(lastExtrude2Index);  // lastextrude2 index
+				indexList[ 2 ] = static_cast<UnsignedShort>(stripStartVertex);  // edgeVertex2 index
 				shadowVolume->SetPolygonIndex( polygonCount, indexList, 3 );
 
-				indexList[ 0 ] = stripStartVertex;  // edgeVertex2 index
-				indexList[ 1 ] = lastExtrude2Index;  // extrude1 index
-				indexList[ 2 ] = stripStartVertex+1;  // extrude2 index
+				indexList[ 0 ] = static_cast<UnsignedShort>(stripStartVertex);  // edgeVertex2 index
+				indexList[ 1 ] = static_cast<UnsignedShort>(lastExtrude2Index);  // extrude1 index
+				indexList[ 2 ] = static_cast<UnsignedShort>(stripStartVertex+1);  // extrude2 index
 				shadowVolume->SetPolygonIndex( polygonCount + 1, indexList, 3 );
 			}
 			else
 			{
+				if (vertexCount + 2 > maxVerts)
+					break;
+
 				//add end of strip.  Finishes the last 2 polygons.
 				geomMesh->GetVertex( currentEdgeEnd, &edgeVertex2 );
 				shadowVolume->SetVertex( vertexCount, &edgeVertex2 );
@@ -2561,9 +2423,9 @@ void W3DVolumetricShadow::constructVolume( Vector3 *lightPosObject,Real shadowEx
 				// add the polygon consisting of the two edge vertices and the
 				// first extruded point
 				//
-				indexList[ 0 ] = lastEdgeVertex2Index;  // lastedgeVertex2 index
-				indexList[ 1 ] = lastExtrude2Index;  // lastextrude2 index
-				indexList[ 2 ] = vertexCount;  // edgeVertex2 index
+				indexList[ 0 ] = static_cast<UnsignedShort>(lastEdgeVertex2Index);  // lastedgeVertex2 index
+				indexList[ 1 ] = static_cast<UnsignedShort>(lastExtrude2Index);  // lastextrude2 index
+				indexList[ 2 ] = static_cast<UnsignedShort>(vertexCount);  // edgeVertex2 index
 				shadowVolume->SetPolygonIndex( polygonCount, indexList, 3 );
 
 				// take the other edge point and extrude away from light
@@ -2573,9 +2435,9 @@ void W3DVolumetricShadow::constructVolume( Vector3 *lightPosObject,Real shadowEx
 				// add the one new vertex
 				shadowVolume->SetVertex( vertexCount + 1, &extrude2 );
 
-				indexList[ 0 ] = vertexCount;  // edgeVertex2 index
-				indexList[ 1 ] = lastExtrude2Index;  // extrude1 index
-				indexList[ 2 ] = vertexCount+1;  // extrude2 index
+				indexList[ 0 ] = static_cast<UnsignedShort>(vertexCount);  // edgeVertex2 index
+				indexList[ 1 ] = static_cast<UnsignedShort>(lastExtrude2Index);  // extrude1 index
+				indexList[ 2 ] = static_cast<UnsignedShort>(vertexCount+1);  // extrude2 index
 				shadowVolume->SetPolygonIndex( polygonCount + 1, indexList, 3 );
 
 				lastEdgeVertex2Index=vertexCount;
@@ -2592,6 +2454,11 @@ void W3DVolumetricShadow::constructVolume( Vector3 *lightPosObject,Real shadowEx
 #endif
 				break;	//reached end of all edges
 			}
+
+			polygonCount += 2;
+
+			if (vertexCount + 2 > maxVerts)
+				break;
 
 			//Start a new strip by adding first vertex and extrusion.
 			geomMesh->GetVertex( silhouetteIndices[ i+2 ], &edgeVertex2 );
@@ -2610,7 +2477,6 @@ void W3DVolumetricShadow::constructVolume( Vector3 *lightPosObject,Real shadowEx
 			shadowVolume->SetVertex( lastExtrude2Index, &extrude2 );
 			vertexCount += 2;
 
-			polygonCount += 2;
 #ifdef RECORD_SHADOW_STRIP_STATS
 			numStrips++;
 			stripLength=1;
@@ -2619,6 +2485,9 @@ void W3DVolumetricShadow::constructVolume( Vector3 *lightPosObject,Real shadowEx
 		}
 		else
 		{
+			if (vertexCount + 2 > maxVerts || polygonCount + 2 > maxPolys)
+				break;
+
 			//continue existing strip by adding extra vertex and extrusion
 
 			geomMesh->GetVertex( currentEdgeEnd, &edgeVertex2 );
@@ -2627,9 +2496,9 @@ void W3DVolumetricShadow::constructVolume( Vector3 *lightPosObject,Real shadowEx
 			// add the polygon consisting of the two edge vertices and the
 			// first extruded point
 			//
-			indexList[ 0 ] = lastEdgeVertex2Index;  // lastedgeVertex2 index
-			indexList[ 1 ] = lastExtrude2Index;  // lastextrude2 index
-			indexList[ 2 ] = vertexCount;  // edgeVertex2 index
+			indexList[ 0 ] = static_cast<UnsignedShort>(lastEdgeVertex2Index);  // lastedgeVertex2 index
+			indexList[ 1 ] = static_cast<UnsignedShort>(lastExtrude2Index);  // lastextrude2 index
+			indexList[ 2 ] = static_cast<UnsignedShort>(vertexCount);  // edgeVertex2 index
 			shadowVolume->SetPolygonIndex( polygonCount, indexList, 3 );
 
 			// take the other edge point and extrude away from light
@@ -2640,9 +2509,9 @@ void W3DVolumetricShadow::constructVolume( Vector3 *lightPosObject,Real shadowEx
 			// add the one new vertex
 			shadowVolume->SetVertex( vertexCount + 1, &extrude2 );
 
-			indexList[ 0 ] = vertexCount;  // edgeVertex2 index
-			indexList[ 1 ] = lastExtrude2Index;  // extrude1 index
-			indexList[ 2 ] = vertexCount+1;  // extrude2 index
+			indexList[ 0 ] = static_cast<UnsignedShort>(vertexCount);  // edgeVertex2 index
+			indexList[ 1 ] = static_cast<UnsignedShort>(lastExtrude2Index);  // extrude1 index
+			indexList[ 2 ] = static_cast<UnsignedShort>(vertexCount+1);  // extrude2 index
 			shadowVolume->SetPolygonIndex( polygonCount + 1, indexList, 3 );
 
 			lastEdgeVertex2Index=vertexCount;
@@ -2694,7 +2563,7 @@ void W3DVolumetricShadow::constructVolumeVB( Vector3 *lightPosObject,Real shadow
 	Geometry *shadowVolume;
 	Vector3 extrude2;  // the polypoints extruded from edge and light
 	Vector3 edgeVertex2;  // second edge of silhouette
-	Int i,k;
+	Int i;
 	Int vertexCount;
 	Int polygonCount;
 	Int indicesPerMesh;
@@ -2746,11 +2615,14 @@ void W3DVolumetricShadow::constructVolumeVB( Vector3 *lightPosObject,Real shadow
 		if (!indicesPerMesh)
 			return;	//nothing to draw
 
-		Short *silhouetteIndices=m_silhouetteIndex[meshIndex];
+		Int *silhouetteIndices=m_silhouetteIndex[meshIndex];
+
+		// Exact O(E) silhouette edge chaining (replaces legacy O(E^2) nested scan)
+		W3DLosslessOpt::ChainSilhouetteEdgesExact(silhouetteIndices, indicesPerMesh);
 
 		//Initialize first strip info
-		Short stripStartIndex=silhouetteIndices[ 0 ];
-		Short stripStartVertex=0;
+		Int stripStartIndex=silhouetteIndices[ 0 ];
+		Int stripStartVertex=0;
 
 		vertexCount=2;
 		Int lastEdgeVertex2Index=0;
@@ -2758,20 +2630,12 @@ void W3DVolumetricShadow::constructVolumeVB( Vector3 *lightPosObject,Real shadow
 
 		for( i = 0; i < indicesPerMesh; i += 2 )
 		{
-			Short currentEdgeEnd=silhouetteIndices[i+1];
+			Int currentEdgeEnd=silhouetteIndices[i+1];
 
-			//look for edge connected to this one and move it next to this edge
-			//in index list.  Rendering edges back-to-back improves vertex cache usage.
-			for (k=i+2; k<indicesPerMesh; k+=2)
-				if (silhouetteIndices[k]==currentEdgeEnd)
-				{
-					//swap the two edges
-					std::swap(silhouetteIndices[i+2], silhouetteIndices[k]);
-					std::swap(silhouetteIndices[i+3], silhouetteIndices[k+1]);
-					break;
-				}
+			// Edges are pre-chained in O(E); consecutive connected edge is directly at i+2.
+			const Bool hasNextConnected = ((i + 2) < indicesPerMesh && silhouetteIndices[i + 2] == currentEdgeEnd);
 
-			if (k >= indicesPerMesh)
+			if (!hasNextConnected)
 			{
 				//reached end of strip. Insert final edge.
 				//Check if last edge wraps around to start.
@@ -2886,11 +2750,11 @@ void W3DVolumetricShadow::constructVolumeVB( Vector3 *lightPosObject,Real shadow
 	shadowVolume->SetNumActivePolygon(polygonCount);
 	shadowVolume->SetNumActiveVertex(vertexCount);
 
-	Short *silhouetteIndices=m_silhouetteIndex[meshIndex];
+	Int *silhouetteIndices=m_silhouetteIndex[meshIndex];
 
 	//Initialize first strip info
-	Short stripStartIndex=silhouetteIndices[ 0 ];
-	Short stripStartVertex=0;
+	Int stripStartIndex=silhouetteIndices[ 0 ];
+	Int stripStartVertex=0;
 
 	//Insert the first vertex and extrusion into strip.
 	// get edge point
@@ -2911,7 +2775,7 @@ void W3DVolumetricShadow::constructVolumeVB( Vector3 *lightPosObject,Real shadow
 
 	for( i = 0; i < indicesPerMesh; i += 2 )
 	{
-		Short currentEdgeEnd=silhouetteIndices[i+1];
+		Int currentEdgeEnd=silhouetteIndices[i+1];
 
 		//Check if another edge is connected to this one, edges were sorted in initial
 		//pass so only need to check the next one.
@@ -3080,6 +2944,8 @@ Bool W3DVolumetricShadow::allocateShadowVolume( Int volumeIndex, Int meshIndex )
 	// optimization may not be worth it
 	//
 	numVertices = m_maxSilhouetteEntries[meshIndex] * 2;
+	if (numVertices > 65535)
+		numVertices = 65535;
 
 	//Only allocate space here for dynamic shadows.  Shadows for static/non-animated
 	//models will be stored in vertex buffers which are allocated once exact size
@@ -3098,6 +2964,8 @@ Bool W3DVolumetricShadow::allocateShadowVolume( Int volumeIndex, Int meshIndex )
 	//		DBGPRINTF(( "Unable to create shadow volume\n" ));
 			assert( 0 );
 			delete shadowVolume;
+			m_shadowVolume[ volumeIndex ][meshIndex] = nullptr;
+			m_shadowVolumeCount[meshIndex]--;
 			return FALSE;
 
 		}
@@ -3192,8 +3060,8 @@ Bool W3DVolumetricShadow::allocateSilhouette(Int meshIndex, Int numVertices )
 					m_numSilhouetteIndices[meshIndex] == 0 &&
 					numEntries > 0 );
 
-	// allocate memory
-	m_silhouetteIndex[meshIndex] = NEW short[ numEntries ];
+	// allocate memory (32-bit indices prevent signed 16-bit wraparound on high-poly meshes)
+	m_silhouetteIndex[meshIndex] = NEW Int[ numEntries ];
 	if( m_silhouetteIndex[meshIndex] == nullptr )
 	{
 
@@ -3422,28 +3290,50 @@ void W3DVolumetricShadowManager::renderShadows( Bool forceStencilFill )
 		lastActiveVertexBuffer=nullptr;	//reset
 
 		m_dynamicShadowVolumesToRender=nullptr;	//clear list of pending dynamic shadows
-		W3DVolumetricShadowRenderTask *shadowDynamicTasksStart,*shadowDynamicTask;
+		W3DVolumetricShadowRenderTask *shadowDynamicTask;
 
-		// step through each of our shadows and render
+		// Phase 1 (Main thread): evaluate visibility, update static shadows, and batch dynamic CPU build jobs.
+		m_pendingDynamicBuilds.clear();
+		m_deferDynamicBuilds = TRUE;
 		for( shadow = m_shadowList; shadow; shadow = shadow->m_next )
 		{
 			if (shadow->m_isEnabled && !shadow->m_isInvisibleEnabled)
 			{
-				//Record last added task
-				shadowDynamicTasksStart=m_dynamicShadowVolumesToRender;
 				shadow->Update();
-				shadowDynamicTask=m_dynamicShadowVolumesToRender;
-				while (shadowDynamicTask != shadowDynamicTasksStart)
-				{
-					//update() added a dynamic shadow
-					//dynamic shadow columns don't need to wait in queue since they
-					//all use the same vertex buffer.  Flush them ASAP.
-					shadow->RenderVolume(shadowDynamicTask->m_meshIndex,shadowDynamicTask->m_lightIndex);
-					//move to next dynamic task
-					shadowDynamicTask=(W3DVolumetricShadowRenderTask *)shadowDynamicTask->m_nextTask;
-					numRenderedShadows++;
-				}
 			}
+		}
+		m_deferDynamicBuilds = FALSE;
+
+		// Phase 2 (Multi-core CPU worker pool): execute all dynamic silhouette + extrusion builds concurrently.
+		// Worker threads touch ONLY disjoint per-shadow RAM buffers (zero D3D8 calls on workers).
+		if (!m_pendingDynamicBuilds.empty())
+		{
+			const size_t jobCount = m_pendingDynamicBuilds.size();
+			W3DLosslessOpt::ParallelFor(
+				jobCount,
+				[this](size_t begin, size_t end)
+				{
+					for (size_t idx = begin; idx < end; ++idx)
+					{
+						const DynamicShadowBuildJob &job = m_pendingDynamicBuilds[idx];
+						job.m_shadow->buildDynamicMeshVolumeJob(
+							job.m_meshIndex,
+							job.m_lightIndex,
+							job.m_lightPosObject,
+							job.m_extrudeDistance);
+					}
+				},
+				1u);
+			m_pendingDynamicBuilds.clear();
+		}
+
+		// Phase 3 (Main thread D3D8): Pass 1 (front-faces CW, stencil INCR) for dynamic shadow volumes.
+		shadowDynamicTask = m_dynamicShadowVolumesToRender;
+		while (shadowDynamicTask)
+		{
+			shadowDynamicTask->m_parentShadow->RenderVolume(shadowDynamicTask->m_meshIndex, shadowDynamicTask->m_lightIndex);
+			shadowDynamicTask = (W3DVolumetricShadowRenderTask *)shadowDynamicTask->m_nextTask;
+			numRenderedShadows++;
 		}
 
 		// Set vertex format to that used by static shadow volumes
@@ -3610,6 +3500,8 @@ W3DVolumetricShadowManager::W3DVolumetricShadowManager()
 {
 
 	m_shadowList = nullptr;
+	m_dynamicShadowVolumesToRender = nullptr;
+	m_deferDynamicBuilds = FALSE;
 
 	m_W3DShadowGeometryManager = NEW W3DShadowGeometryManager;
 

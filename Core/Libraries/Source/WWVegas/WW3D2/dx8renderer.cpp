@@ -59,6 +59,8 @@
 #include "camera.h"
 #include "stripoptimizer.h"
 #include "meshgeometry.h"
+#include "w3d_lossless_opt.h"
+#include <vector>
 
 /*
 ** Global Instance of the DX8MeshRender
@@ -999,8 +1001,9 @@ void DX8RigidFVFCategoryContainer::Add_Mesh(MeshModelClass* mmc_)
 	** enough to contain this mesh.
 	*/
 	if (!vertex_buffer) {
-		int vb_size=4000;
+		int vb_size=32768;
 		if (vb_size<needed_vertices) vb_size=needed_vertices;
+		if (vb_size>65535) vb_size=65535;
 		if (sorting) {
 			vertex_buffer=NEW_REF(SortingVertexBufferClass,(vb_size));
 			WWASSERT(vertex_buffer->FVF_Info().Get_FVF()==FVF);	// Only one sorting FVF type!
@@ -1199,8 +1202,9 @@ void DX8FVFCategoryContainer::Generate_Texture_Categories(Vertex_Split_Table& sp
 	** more if the mesh requires it.
 	*/
 	if (!index_buffer) {
-		int ib_size=12000;
+		int ib_size=60000;
 		if (ib_size<index_count) ib_size=index_count;
+		if (ib_size>65535) ib_size=65535;
 		if (sorting) {
 			index_buffer=NEW_REF(SortingIndexBufferClass,(ib_size));
 		}
@@ -1354,40 +1358,81 @@ void DX8SkinFVFCategoryContainer::Render()
 
 				mesh->Get_Deformed_Vertices(loc,norm);
 
-				for (int v=0;v<mesh_vertex_count;++v) {
-					verts[v].x=(*loc)[0];
-					verts[v].y=(*loc)[1];
-					verts[v].z=(*loc)[2];
-					verts[v].nx=(*norm)[0];
-					verts[v].ny=(*norm)[1];
-					verts[v].nz=(*norm)[2];
-					if (diffuse) {
-						verts[v].diffuse=*diffuse++;
-					}
-					else {
+				// Hoist optional vertex attribute checks out of the write-combined VRAM write loop
+				if (uv0 && !uv1 && !diffuse) {
+					for (int v=0;v<mesh_vertex_count;++v) {
+						verts[v].x=loc[v].X;
+						verts[v].y=loc[v].Y;
+						verts[v].z=loc[v].Z;
+						verts[v].nx=norm[v].X;
+						verts[v].ny=norm[v].Y;
+						verts[v].nz=norm[v].Z;
 						verts[v].diffuse=0;
-					}
-					if (uv0) {
-						verts[v].u1=(*uv0)[0];
-						verts[v].v1=(*uv0)[1];
-						uv0++;
-					}
-					else {
-						verts[v].u1=0.0f;
-						verts[v].v1=0.0f;
-					}
-					if (uv1) {
-						verts[v].u2=(*uv1)[0];
-						verts[v].v2=(*uv1)[1];
-						uv1++;
-					}
-					else {
+						verts[v].u1=uv0[v].X;
+						verts[v].v1=uv0[v].Y;
 						verts[v].u2=0.0f;
 						verts[v].v2=0.0f;
 					}
-
-					loc++;
-					norm++;
+				}
+				else if (uv0 && !uv1 && diffuse) {
+					for (int v=0;v<mesh_vertex_count;++v) {
+						verts[v].x=loc[v].X;
+						verts[v].y=loc[v].Y;
+						verts[v].z=loc[v].Z;
+						verts[v].nx=norm[v].X;
+						verts[v].ny=norm[v].Y;
+						verts[v].nz=norm[v].Z;
+						verts[v].diffuse=diffuse[v];
+						verts[v].u1=uv0[v].X;
+						verts[v].v1=uv0[v].Y;
+						verts[v].u2=0.0f;
+						verts[v].v2=0.0f;
+					}
+				}
+				else if (uv0 && uv1 && !diffuse) {
+					for (int v=0;v<mesh_vertex_count;++v) {
+						verts[v].x=loc[v].X;
+						verts[v].y=loc[v].Y;
+						verts[v].z=loc[v].Z;
+						verts[v].nx=norm[v].X;
+						verts[v].ny=norm[v].Y;
+						verts[v].nz=norm[v].Z;
+						verts[v].diffuse=0;
+						verts[v].u1=uv0[v].X;
+						verts[v].v1=uv0[v].Y;
+						verts[v].u2=uv1[v].X;
+						verts[v].v2=uv1[v].Y;
+					}
+				}
+				else if (uv0 && uv1 && diffuse) {
+					for (int v=0;v<mesh_vertex_count;++v) {
+						verts[v].x=loc[v].X;
+						verts[v].y=loc[v].Y;
+						verts[v].z=loc[v].Z;
+						verts[v].nx=norm[v].X;
+						verts[v].ny=norm[v].Y;
+						verts[v].nz=norm[v].Z;
+						verts[v].diffuse=diffuse[v];
+						verts[v].u1=uv0[v].X;
+						verts[v].v1=uv0[v].Y;
+						verts[v].u2=uv1[v].X;
+						verts[v].v2=uv1[v].Y;
+					}
+				}
+				else {
+					for (int v=0;v<mesh_vertex_count;++v) {
+						verts[v].x=loc[v].X;
+						verts[v].y=loc[v].Y;
+						verts[v].z=loc[v].Z;
+						verts[v].nx=norm[v].X;
+						verts[v].ny=norm[v].Y;
+						verts[v].nz=norm[v].Z;
+						verts[v].diffuse=diffuse ? diffuse[v] : 0;
+						verts[v].u1=uv0 ? uv0[v].X : 0.0f;
+						verts[v].v1=uv0 ? uv0[v].Y : 0.0f;
+						verts[v].u2=uv1 ? uv1[v].X : 0.0f;
+						verts[v].v2=uv1 ? uv1[v].Y : 0.0f;
+					}
 				}
 
 				mesh->Set_Base_Vertex_Offset(vertex_offset);
@@ -1611,63 +1656,80 @@ unsigned DX8TextureCategoryClass::Add_Mesh(
 
 		// Need to check stripify again as it may be changed to false by the previous statement
 		if (!stripify ) {
-			DX8PolygonRendererClass* p_renderer=W3DNEW DX8PolygonRendererClass(
-				index_count,
-				split_table.Get_Mesh_Model_Class(),
-				this,
-				vertex_offset,
-				index_offset,
-				false,
-				pass);
-			PolygonRendererList.Add_Tail(p_renderer);
+			// Guard against 16-bit index buffer capacity overflow on ultra-high-poly sub-meshes
+			const unsigned ibCapacity = index_buffer->Get_Index_Count();
+			const unsigned maxAvailableIndices = (index_offset < ibCapacity) ? (ibCapacity - index_offset) : 0u;
+			const unsigned maxAllowedPolys = maxAvailableIndices / 3u;
+			const unsigned clampedPolys = (polygons <= maxAllowedPolys) ? polygons : maxAllowedPolys;
+			index_count = clampedPolys * 3u;
 
-			IndexBufferClass::AppendLockClass l(index_buffer,index_offset,index_count);
-			unsigned short* dst_indices=l.Get_Index_Array();
+			if (clampedPolys > 0u) {
+				// Collect matching triangles in CPU RAM (zero reads from write-combined VRAM)
+				std::vector<uint16_t> localIndices;
+				localIndices.reserve(index_count);
+				const unsigned meshVertCount = static_cast<unsigned>(split_table.Get_Vertex_Count());
 
-			unsigned short vmin=0xffff;
-			unsigned short vmax=0;
+				for (int i=0;i<poly_count && (localIndices.size() / 3u) < clampedPolys;++i) {
+					bool all_textures_same = true;
+					for (unsigned int stage = 0; stage < MeshMatDescClass::MAX_TEX_STAGES; stage++) {
+						all_textures_same = all_textures_same && (split_table.Peek_Texture(i, pass, stage) == textures[stage]);
+					}
+					VertexMaterialClass* mat=split_table.Peek_Material(i,pass);
+					ShaderClass shd=split_table.Peek_Shader(i,pass);
 
-			/*
-			** Iterate over the polys for this pass, adding each one that matches this texture+material+shader
-			*/
-			for (int i=0;i<poly_count;++i) {
-				bool all_textures_same = true;
-				for (unsigned int stage = 0; stage < MeshMatDescClass::MAX_TEX_STAGES; stage++) {
-					all_textures_same = all_textures_same && (split_table.Peek_Texture(i, pass, stage) == textures[stage]);
+					if (all_textures_same && Equal_Material(mat,material) && shd==shader) {
+						localIndices.push_back(static_cast<uint16_t>(src_indices[i][0]));
+						localIndices.push_back(static_cast<uint16_t>(src_indices[i][1]));
+						localIndices.push_back(static_cast<uint16_t>(src_indices[i][2]));
+					}
 				}
-				VertexMaterialClass* mat=split_table.Peek_Material(i,pass);
-				ShaderClass shd=split_table.Peek_Shader(i,pass);
 
-				if (all_textures_same && Equal_Material(mat,material) && shd==shader) {
-					unsigned short idx;
+				const unsigned actualPolys = static_cast<unsigned>(localIndices.size() / 3u);
+				index_count = actualPolys * 3u;
 
-					idx=(unsigned short)(src_indices[i][0]+vertex_offset);
-					vmin=MIN(vmin,idx);
-					vmax=MAX(vmax,idx);
-					*dst_indices++=idx;
-//					WWDEBUG_SAY(("%d, ",idx));
-
-					idx=(unsigned short)(src_indices[i][1]+vertex_offset);
-					vmin=MIN(vmin,idx);
-					vmax=MAX(vmax,idx);
-					*dst_indices++=idx;
-//					WWDEBUG_SAY(("%d, ",idx));
-
-					idx=(unsigned short)(src_indices[i][2]+vertex_offset);
-					vmin=MIN(vmin,idx);
-					vmax=MAX(vmax,idx);
-					*dst_indices++=idx;
-//					WWDEBUG_SAY(("%d",idx));
+				// 100% lossless Tom Forsyth post-transform vertex cache reordering (exact same triangles & winding)
+				std::vector<uint16_t> optimizedIndices(index_count);
+				if (actualPolys >= 4u) {
+					W3DLosslessOpt::OptimizeVertexCacheForsyth(
+						localIndices.data(),
+						optimizedIndices.data(),
+						actualPolys,
+						meshVertCount);
+				} else {
+					std::memcpy(optimizedIndices.data(), localIndices.data(), index_count * sizeof(uint16_t));
 				}
+
+				DX8PolygonRendererClass* p_renderer=W3DNEW DX8PolygonRendererClass(
+					index_count,
+					split_table.Get_Mesh_Model_Class(),
+					this,
+					vertex_offset,
+					index_offset,
+					false,
+					pass);
+				PolygonRendererList.Add_Tail(p_renderer);
+
+				IndexBufferClass::AppendLockClass l(index_buffer,index_offset,index_count);
+				unsigned short* dst_indices=l.Get_Index_Array();
+
+				unsigned short vmin=0xffff;
+				unsigned short vmax=0;
+
+				for (unsigned idxPos = 0u; idxPos < index_count; ++idxPos) {
+					const unsigned short idx = static_cast<unsigned short>(optimizedIndices[idxPos] + vertex_offset);
+					if (idx < vmin) vmin = idx;
+					if (idx > vmax) vmax = idx;
+					dst_indices[idxPos] = idx;
+				}
+
+				WWASSERT((vmax-vmin)<split_table.Get_Mesh_Model_Class()->Get_Vertex_Count());
+
+				/*
+				** Remember the min and max vertex indices that these polygons used (for optimization)
+				*/
+				p_renderer->Set_Vertex_Index_Range(vmin,vmax-vmin+1);
+				WWASSERT(index_count<=unsigned(split_table.Get_Polygon_Count()*3));
 			}
-
-			WWASSERT((vmax-vmin)<split_table.Get_Mesh_Model_Class()->Get_Vertex_Count());
-
-			/*
-			** Remember the min and max vertex indices that these polygons used (for optimization)
-			*/
-			p_renderer->Set_Vertex_Index_Range(vmin,vmax-vmin+1);
-			WWASSERT(index_count<=unsigned(split_table.Get_Polygon_Count()*3));
 		}
 	}
 

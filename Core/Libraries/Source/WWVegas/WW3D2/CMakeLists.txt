@@ -62,6 +62,8 @@ set(WW3D2_SRC
     dx8vertexbuffer.h
     dx8wrapper.cpp
     dx8wrapper.h
+    w3d_lossless_opt.cpp
+    w3d_lossless_opt.h
     dynamesh.cpp
     dynamesh.h
     font3d.cpp

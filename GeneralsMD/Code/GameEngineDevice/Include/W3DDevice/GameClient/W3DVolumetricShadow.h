@@ -28,6 +28,8 @@
 #include "W3DDevice/GameClient/W3DBufferManager.h"
 #include "GameClient/Shadow.h"
 
+#include <vector>
+
 ///@todo Make the 100 below a 'better' number. Was 32, increased because of overcomplex models.
 #define MAX_SHADOW_CASTER_MESHES	160	//number of meshes allowed in animated hierarchy (must be <256 since index is a byte).
 
@@ -65,6 +67,28 @@ public:
 		m_dynamicShadowVolumesToRender=task;
 		m_dynamicShadowVolumesToRender->m_nextTask=oldTask;
 	}
+
+	struct DynamicShadowBuildJob
+	{
+		W3DVolumetricShadow *m_shadow;
+		Int m_meshIndex;
+		Int m_lightIndex;
+		Vector3 m_lightPosObject;
+		Real m_extrudeDistance;
+	};
+
+	Bool isDeferringDynamicBuilds() const { return m_deferDynamicBuilds; }
+	void enqueueDynamicShadowBuild(W3DVolumetricShadow *shadow, Int meshIndex, Int lightIndex, const Vector3 &lightPosObject, Real extrudeDistance)
+	{
+		DynamicShadowBuildJob job;
+		job.m_shadow = shadow;
+		job.m_meshIndex = meshIndex;
+		job.m_lightIndex = lightIndex;
+		job.m_lightPosObject = lightPosObject;
+		job.m_extrudeDistance = extrudeDistance;
+		m_pendingDynamicBuilds.push_back(job);
+	}
+
 	void invalidateCachedLightPositions();	///<forces shadow volumes to update regardless of last lightposition
 	void loadTerrainShadows();
 
@@ -81,6 +105,8 @@ protected:
 		W3DVolumetricShadow *m_shadowList;
 		W3DVolumetricShadowRenderTask *m_dynamicShadowVolumesToRender;
 		W3DShadowGeometryManager *m_W3DShadowGeometryManager;
+		Bool m_deferDynamicBuilds;
+		std::vector<DynamicShadowBuildJob> m_pendingDynamicBuilds;
 };
 
 extern W3DVolumetricShadowManager *TheW3DVolumetricShadowManager;
@@ -138,12 +164,13 @@ class W3DVolumetricShadow	: public Shadow
 		void buildSilhouette(Int meshIndex, Vector3 *lightPosWorld);
 		void addSilhouetteEdge(Int meshIndex, PolyNeighbor *visible, PolyNeighbor *hidden );
 		void addNeighborlessEdges(Int meshIndex, PolyNeighbor *us );
-		void addSilhouetteIndices(Int meshIndex, Short edgeStart, Short edgeEnd );
+		void addSilhouetteIndices(Int meshIndex, Int edgeStart, Int edgeEnd );
 		Bool allocateSilhouette(Int meshIndex, Int numVertices );  // allocate memory for sil
 		void deleteSilhouette(Int meshIndex );  // resets and frees silhouette memory
 		void resetSilhouette( Int meshIndex );  // reset silhouette to empty
 
 		// shadow volume access
+		void buildDynamicMeshVolumeJob(Int meshIndex, Int lightIndex, const Vector3 &lightPosObject, Real shadowExtrudeDistance);
 		void constructVolume( Vector3 *lightPos, Real shadowExtrudeDistance, Int volumeIndex, Int meshIndex );
 		void constructVolumeVB( Vector3 *lightPosObject,Real shadowExtrudeDistance, Int volumeIndex, Int meshIndex );
 		Bool allocateShadowVolume( Int volumeIndex, Int meshIndex );  // allocate mem
@@ -174,14 +201,14 @@ class W3DVolumetricShadow	: public Shadow
 		Vector3 m_lightPosHistory[ MAX_SHADOW_LIGHTS ][MAX_SHADOW_CASTER_MESHES];
 		Matrix4x4 m_objectXformHistory[ MAX_SHADOW_LIGHTS ][MAX_SHADOW_CASTER_MESHES];
 
-		// silhouette building space
-		Short *m_silhouetteIndex[MAX_SHADOW_CASTER_MESHES];  // silhouette vertex index list, edges occur
+		// silhouette building space (32-bit indices prevent signed 16-bit overflow on 7,000+ vertex high-poly meshes)
+		Int *m_silhouetteIndex[MAX_SHADOW_CASTER_MESHES];  // silhouette vertex index list, edges occur
 									 // as disjoint pairs.  The actual size of this
 									 // piece of memory must accommodate #vertices*2
-		Short m_numSilhouetteIndices[MAX_SHADOW_CASTER_MESHES];  // total number of edge indices in the index
+		Int m_numSilhouetteIndices[MAX_SHADOW_CASTER_MESHES];  // total number of edge indices in the index
 									   // array, these are pairs and therefore
 									   // always a multiple of two
-		Short m_maxSilhouetteEntries[MAX_SHADOW_CASTER_MESHES];  // how big the silhouette index can hold max
+		Int m_maxSilhouetteEntries[MAX_SHADOW_CASTER_MESHES];  // how big the silhouette index can hold max
 
 		Int	  m_numIndicesPerMesh[MAX_SHADOW_CASTER_MESHES];	///<silhouette indices from each mesh.
 
