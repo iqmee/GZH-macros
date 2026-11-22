@@ -32,6 +32,7 @@
 #include "Common/Debug.h"
 #include "Common/GlobalData.h"
 #include "Common/LocalFileSystem.h"
+#include "GameClient/Display.h"
 #include "GameClient/GameClient.h"
 #include "Win32Device/GameClient/Win32Mouse.h"
 #include "WinMain.h"
@@ -232,6 +233,25 @@ void Win32Mouse::translateEvent( UnsignedInt eventIndex, MouseIO *result )
 
 		}
 
+	}
+
+	// Scale client-area coordinates into logical backbuffer coordinates when borderless
+	// fullscreen presents a resolution scaled to fit the monitor (1:1 no-op when equal).
+	if (ApplicationHWnd && TheDisplay)
+	{
+		RECT clientRect;
+		if (::GetClientRect(ApplicationHWnd, &clientRect))
+		{
+			const Int clientW = clientRect.right - clientRect.left;
+			const Int clientH = clientRect.bottom - clientRect.top;
+			const Int dispW = static_cast<Int>(TheDisplay->getWidth());
+			const Int dispH = static_cast<Int>(TheDisplay->getHeight());
+			if (clientW > 0 && clientH > 0 && dispW > 0 && dispH > 0 && (clientW != dispW || clientH != dispH))
+			{
+				result->pos.x = (result->pos.x * dispW) / clientW;
+				result->pos.y = (result->pos.y * dispH) / clientH;
+			}
+		}
 	}
 
 }

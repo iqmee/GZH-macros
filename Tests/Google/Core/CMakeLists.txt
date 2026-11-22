@@ -9,6 +9,7 @@ set(COREI_GOOGLETEST_SRC
     GameEngine/GameLogic/PathfindOverhaulTest.cpp
     GameEngineDevice/StdDevice/Common/StdLocalFileSystemTest.cpp
     Libraries/Compression/CompressionManagerTest.cpp
+    Libraries/WWVegas/WW3D2/ResolutionFallbackTest.cpp
     Libraries/WWVegas/WW3D2/TextureAtlasTest.cpp
     Libraries/WWVegas/WW3D2/hlod_test.cpp
     Libraries/WWVegas/WW3D2/soundrobj_test.cpp

@@ -74,6 +74,8 @@ HWND ApplicationHWnd = nullptr;  ///< our application window handle
 Win32Mouse *TheWin32Mouse = nullptr;  ///< for the WndProc() only
 DWORD TheMessageTime = 0;	///< For getting the time that a message was posted from Windows.
 
+extern "C" void DX8Wrapper_OnAppActivate(bool active);
+
 const Char *g_strFile = "data\\Generals.str";
 const Char *g_csfFile = "data\\%s\\Generals.csf";
 const char *gAppPrefix = ""; /// So WB can have a different debug log file name.
@@ -467,6 +469,8 @@ LRESULT CALLBACK WndProc( HWND hWnd, UINT message,
 					// paths that take care of that.
 
 					isWinMainActive = (BOOL) wParam;
+
+					DX8Wrapper_OnAppActivate(isWinMainActive != FALSE);
 
 					if (TheGameEngine)
 						TheGameEngine->setIsActive(isWinMainActive);

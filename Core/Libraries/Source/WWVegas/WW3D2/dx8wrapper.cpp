@@ -105,6 +105,8 @@ int DX8Wrapper_PreserveFPU = 0;
 ***********************************************************************************/
 
 static HWND						_Hwnd															= nullptr;
+static HWND						_BackdropHwnd												= nullptr;
+static bool						_BackdropClassRegistered									= false;
 bool								DX8Wrapper::IsInitted									= false;
 bool								DX8Wrapper::_EnableTriangleDraw						= true;
 
@@ -114,6 +116,7 @@ int								DX8Wrapper::ResolutionHeight							= DEFAULT_RESOLUTION_HEIGHT;
 int								DX8Wrapper::BitDepth										= DEFAULT_BIT_DEPTH;
 int								DX8Wrapper::TextureBitDepth							= DEFAULT_TEXTURE_BIT_DEPTH;
 bool								DX8Wrapper::IsWindowed									= false;
+bool								DX8Wrapper::IsBorderlessFullscreen					= false;
 D3DFORMAT					DX8Wrapper::DisplayFormat	= D3DFMT_UNKNOWN;
 D3DMULTISAMPLE_TYPE DX8Wrapper::MultiSampleAntiAliasing	= DEFAULT_MSAA;
 
@@ -290,6 +293,7 @@ bool DX8Wrapper::Init(void * hwnd, bool lite)
 	Render2DClass::Set_Screen_Resolution( RectClass( 0, 0, ResolutionWidth, ResolutionHeight ) );
 	BitDepth = DEFAULT_BIT_DEPTH;
 	IsWindowed = false;
+	IsBorderlessFullscreen = false;
 	DX8Wrapper_IsWindowed = false;
 
 	for (int light=0;light<4;++light) CurrentDX8LightEnables[light]=false;
@@ -356,6 +360,9 @@ void DX8Wrapper::Shutdown()
 		Set_Render_Target ((IDirect3DSurface8 *)nullptr);
 		Release_Device();
 	}
+
+	Destroy_Backdrop_Window();
+	IsBorderlessFullscreen = false;
 
 	if (D3DInterface) {
 		D3DInterface->Release();
@@ -576,6 +583,22 @@ bool DX8Wrapper::Create_Device()
 		&D3DDevice
 	);
 
+	if (FAILED(hr) && _PresentParameters.MultiSampleType != D3DMULTISAMPLE_NONE)
+	{
+		// Some drivers report MSAA support via CheckDeviceMultiSampleType yet reject CreateDevice in windowed/borderless mode.
+		MultiSampleAntiAliasing = D3DMULTISAMPLE_NONE;
+		_PresentParameters.MultiSampleType = D3DMULTISAMPLE_NONE;
+		hr = D3DInterface->CreateDevice
+		(
+			CurRenderDevice,
+			WW3D_DEVTYPE,
+			_Hwnd,
+			Vertex_Processing_Behavior,
+			&_PresentParameters,
+			&D3DDevice
+		);
+	}
+
 	if (FAILED(hr))
 	{
 		// The device selection may fail because the device lied that it supports 32 bit zbuffer with 16 bit
@@ -709,6 +732,8 @@ void DX8Wrapper::Release_Device()
 		D3DDevice->Release();
 		D3DDevice=nullptr;
 	}
+	Destroy_Backdrop_Window();
+	IsBorderlessFullscreen = false;
 }
 
 void DX8Wrapper::Enumerate_Devices()
@@ -750,6 +775,9 @@ void DX8Wrapper::Enumerate_Devices()
 			** Enumerate the resolutions
 			*/
 			desc.reset_resolution_list();
+			int max_native_w = 0;
+			int max_native_h = 0;
+			bool has_32bit = false;
 			int mode_count = D3DInterface->GetAdapterModeCount(adapter_index);
 			for (int mode_index=0; mode_index<mode_count; mode_index++) {
 				D3DDISPLAYMODE d3dmode;
@@ -779,9 +807,43 @@ void DX8Wrapper::Enumerate_Devices()
 					*/
 					if (bits != 0) {
 						desc.add_resolution(d3dmode.Width,d3dmode.Height,bits);
+						if ((int)d3dmode.Width > max_native_w) max_native_w = (int)d3dmode.Width;
+						if ((int)d3dmode.Height > max_native_h) max_native_h = (int)d3dmode.Height;
+						if (bits == 32) has_32bit = true;
 					}
 				}
 			}
+
+			// Include desktop dimensions in case current monitor mode exceeds enumerated modes
+			D3DDISPLAYMODE desktop_mode;
+			::ZeroMemory(&desktop_mode, sizeof(D3DDISPLAYMODE));
+			if (SUCCEEDED(D3DInterface->GetAdapterDisplayMode(adapter_index, &desktop_mode))) {
+				if ((int)desktop_mode.Width > max_native_w) max_native_w = (int)desktop_mode.Width;
+				if ((int)desktop_mode.Height > max_native_h) max_native_h = (int)desktop_mode.Height;
+			}
+
+			// Add common aspect-ratio resolutions (such as 1920x1440 on 1440p/ultrawide displays)
+			// that some GPU drivers (e.g. AMD/Intel) omit from exclusive-fullscreen EnumAdapterModes.
+			// These run seamlessly via the borderless fullscreen fallback when not natively advertised.
+			if (has_32bit && max_native_w > 0 && max_native_h > 0) {
+				static const int kVirtualResolutions[][2] = {
+					{ 1440, 1080 },
+					{ 1920, 1440 },
+					{ 2560, 1440 },
+					{ 2560, 1920 },
+					{ 2880, 2160 }
+				};
+				for (size_t i = 0; i < ARRAY_SIZE(kVirtualResolutions); ++i) {
+					const int vw = kVirtualResolutions[i][0];
+					const int vh = kVirtualResolutions[i][1];
+					if (vw <= max_native_w && vh <= max_native_h &&
+						dx8caps.Is_Valid_Display_Format(vw, vh, WW3D_FORMAT_X8R8G8B8))
+					{
+						desc.add_resolution(vw, vh, 32);
+					}
+				}
+			}
+			desc.sort_resolutions();
 
 			// IML: If the device has one or more valid resolutions add it to the device list.
 			// NOTE: Testing has shown that there are drivers with zero resolutions.
@@ -889,8 +951,146 @@ void DX8Wrapper::Get_Format_Name(unsigned int format, StringClass *tex_format)
 		}
 }
 
+static LRESULT CALLBACK BackdropWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+	if (msg == WM_ERASEBKGND) {
+		HDC hdc = (HDC)wParam;
+		RECT rc;
+		::GetClientRect(hwnd, &rc);
+		::FillRect(hdc, &rc, (HBRUSH)::GetStockObject(BLACK_BRUSH));
+		return 1;
+	}
+	return ::DefWindowProc(hwnd, msg, wParam, lParam);
+}
+
+void DX8Wrapper::Update_Backdrop_Window(bool visible, int left, int top, int width, int height)
+{
+	if (!visible) {
+		if (_BackdropHwnd && ::IsWindow(_BackdropHwnd)) {
+			::ShowWindow(_BackdropHwnd, SW_HIDE);
+		}
+		return;
+	}
+
+	if (!_Hwnd || !::IsWindow(_Hwnd)) {
+		return;
+	}
+
+	HINSTANCE hInst = (HINSTANCE)::GetWindowLongPtr(_Hwnd, GWLP_HINSTANCE);
+	if (!hInst) {
+		hInst = ::GetModuleHandle(nullptr);
+	}
+
+	if (!_BackdropClassRegistered) {
+		WNDCLASS wc;
+		::ZeroMemory(&wc, sizeof(wc));
+		wc.lpfnWndProc = BackdropWndProc;
+		wc.hInstance = hInst;
+		wc.hbrBackground = (HBRUSH)::GetStockObject(BLACK_BRUSH);
+		wc.lpszClassName = TEXT("GeneralsFullscreenBackdrop");
+		::RegisterClass(&wc);
+		_BackdropClassRegistered = true;
+	}
+
+	if (!_BackdropHwnd || !::IsWindow(_BackdropHwnd)) {
+		_BackdropHwnd = ::CreateWindowEx(
+			WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+			TEXT("GeneralsFullscreenBackdrop"),
+			TEXT(""),
+			WS_POPUP | WS_DISABLED,
+			left, top, width, height,
+			nullptr, nullptr, hInst, nullptr);
+	}
+
+	if (_BackdropHwnd && ::IsWindow(_BackdropHwnd)) {
+		// Place backdrop directly behind the game window covering the full monitor in black
+		::SetWindowPos(_BackdropHwnd, _Hwnd, left, top, width, height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+		::InvalidateRect(_BackdropHwnd, nullptr, TRUE);
+	}
+}
+
+void DX8Wrapper::Destroy_Backdrop_Window()
+{
+	if (_BackdropHwnd) {
+		if (::IsWindow(_BackdropHwnd)) {
+			::DestroyWindow(_BackdropHwnd);
+		}
+		_BackdropHwnd = nullptr;
+	}
+}
+
+void DX8Wrapper::On_App_Activate(bool active)
+{
+	if (!IsBorderlessFullscreen || !_Hwnd || !::IsWindow(_Hwnd)) {
+		return;
+	}
+
+	if (!active) {
+		if (_BackdropHwnd && ::IsWindow(_BackdropHwnd)) {
+			::ShowWindow(_BackdropHwnd, SW_HIDE);
+		}
+		::SetWindowPos(_Hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+	} else {
+		MONITORINFO mi = { sizeof(MONITORINFO) };
+		::GetMonitorInfo(::MonitorFromWindow(_Hwnd, MONITOR_DEFAULTTOPRIMARY), &mi);
+		const int monW = mi.rcMonitor.right - mi.rcMonitor.left;
+		const int monH = mi.rcMonitor.bottom - mi.rcMonitor.top;
+		::SetWindowPos(_Hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+		Update_Backdrop_Window(true, mi.rcMonitor.left, mi.rcMonitor.top, monW, monH);
+	}
+}
+
+extern "C" void DX8Wrapper_OnAppActivate(bool active)
+{
+	DX8Wrapper::On_App_Activate(active);
+}
+
 void DX8Wrapper::Resize_And_Position_Window()
 {
+	if (!_Hwnd || !::IsWindow(_Hwnd)) {
+		return;
+	}
+
+	// Borderless virtual fullscreen: center aspect-ratio-preserving game window over a pure-black full-monitor backdrop.
+	if (!IsWindowed && IsBorderlessFullscreen) {
+		MONITORINFO mi = { sizeof(MONITORINFO) };
+		::GetMonitorInfo(::MonitorFromWindow(_Hwnd, MONITOR_DEFAULTTOPRIMARY), &mi);
+		const int monW = mi.rcMonitor.right - mi.rcMonitor.left;
+		const int monH = mi.rcMonitor.bottom - mi.rcMonitor.top;
+
+		int winW = ResolutionWidth;
+		int winH = ResolutionHeight;
+		if (monW > 0 && monH > 0 && ResolutionWidth > 0 && ResolutionHeight > 0) {
+			const double scaleX = static_cast<double>(monW) / static_cast<double>(ResolutionWidth);
+			const double scaleY = static_cast<double>(monH) / static_cast<double>(ResolutionHeight);
+			const double scale = (scaleX < scaleY) ? scaleX : scaleY;
+			winW = static_cast<int>(ResolutionWidth * scale + 0.5);
+			winH = static_cast<int>(ResolutionHeight * scale + 0.5);
+			if (winW < 1) winW = 1;
+			if (winH < 1) winH = 1;
+			if (winW > monW) winW = monW;
+			if (winH > monH) winH = monH;
+		}
+
+		const int left = mi.rcMonitor.left + (monW - winW) / 2;
+		const int top  = mi.rcMonitor.top + (monH - winH) / 2;
+
+		DWORD style = (DWORD)::GetWindowLong(_Hwnd, GWL_STYLE);
+		const DWORD desiredStyle = (style & ~(WS_CAPTION | WS_THICKFRAME | WS_DLGFRAME | WS_BORDER | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU)) | WS_POPUP | WS_VISIBLE;
+		if (style != desiredStyle) {
+			::SetWindowLong(_Hwnd, GWL_STYLE, desiredStyle);
+		}
+
+		::SetWindowPos(_Hwnd, HWND_TOPMOST, left, top, winW, winH, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+		Update_Backdrop_Window(true, mi.rcMonitor.left, mi.rcMonitor.top, monW, monH);
+
+		DEBUG_LOG(("Borderless fullscreen window positioned to x:%d y:%d, size w:%d h:%d (game %dx%d on monitor %dx%d)",
+			left, top, winW, winH, ResolutionWidth, ResolutionHeight, monW, monH));
+		return;
+	}
+
+	Destroy_Backdrop_Window();
+
 	// Get the current dimensions of the 'render area' of the window
 	RECT rect = { 0 };
 	::GetClientRect (_Hwnd, &rect);
@@ -943,6 +1143,105 @@ void DX8Wrapper::Resize_And_Position_Window()
 	}
 }
 
+bool DX8Wrapper::Configure_Present_Parameters(bool use_borderless_fullscreen)
+{
+	::ZeroMemory(&_PresentParameters, sizeof(D3DPRESENT_PARAMETERS));
+
+	const bool d3d_windowed = IsWindowed || use_borderless_fullscreen;
+	IsBorderlessFullscreen = (!IsWindowed) && use_borderless_fullscreen;
+
+	_PresentParameters.BackBufferWidth = ResolutionWidth;
+	_PresentParameters.BackBufferHeight = ResolutionHeight;
+	_PresentParameters.BackBufferCount = d3d_windowed ? 1 : 2;
+	_PresentParameters.SwapEffect = D3DSWAPEFFECT_DISCARD;
+	_PresentParameters.hDeviceWindow = _Hwnd;
+	_PresentParameters.Windowed = d3d_windowed;
+	_PresentParameters.EnableAutoDepthStencil = TRUE;
+	_PresentParameters.Flags = 0;
+	_PresentParameters.FullScreen_PresentationInterval = D3DPRESENT_INTERVAL_DEFAULT;
+	_PresentParameters.FullScreen_RefreshRateInHz = D3DPRESENT_RATE_DEFAULT;
+
+	if (d3d_windowed) {
+		D3DDISPLAYMODE desktop_mode;
+		::ZeroMemory(&desktop_mode, sizeof(D3DDISPLAYMODE));
+		if (FAILED(D3DInterface->GetAdapterDisplayMode(CurRenderDevice, &desktop_mode))) {
+			return false;
+		}
+
+		DisplayFormat = _PresentParameters.BackBufferFormat = desktop_mode.Format;
+
+		switch (_PresentParameters.BackBufferFormat) {
+		case D3DFMT_X8R8G8B8:
+		case D3DFMT_A8R8G8B8:
+		case D3DFMT_R8G8B8: BitDepth = 32; break;
+		case D3DFMT_A4R4G4B4:
+		case D3DFMT_A1R5G5B5:
+		case D3DFMT_R5G6B5: BitDepth = 16; break;
+		case D3DFMT_L8:
+		case D3DFMT_A8:
+		case D3DFMT_P8: BitDepth = 8; break;
+		default:
+			return false;
+		}
+
+		if (BitDepth == 32 && D3DInterface->CheckDeviceType(CurRenderDevice, D3DDEVTYPE_HAL, desktop_mode.Format, D3DFMT_A8R8G8B8, TRUE) == D3D_OK) {
+			_PresentParameters.BackBufferFormat = D3DFMT_A8R8G8B8;
+		}
+
+		if (!Find_Z_Mode(DisplayFormat, _PresentParameters.BackBufferFormat, &_PresentParameters.AutoDepthStencilFormat)) {
+			if (BitDepth == 32) {
+				BitDepth = 16;
+				_PresentParameters.BackBufferFormat = D3DFMT_R5G6B5;
+				if (!Find_Z_Mode(_PresentParameters.BackBufferFormat, _PresentParameters.BackBufferFormat, &_PresentParameters.AutoDepthStencilFormat)) {
+					_PresentParameters.AutoDepthStencilFormat = D3DFMT_UNKNOWN;
+				}
+			} else {
+				_PresentParameters.AutoDepthStencilFormat = D3DFMT_UNKNOWN;
+			}
+		}
+	} else {
+		if (!Find_Color_And_Z_Mode(ResolutionWidth, ResolutionHeight, BitDepth, &DisplayFormat,
+			&_PresentParameters.BackBufferFormat, &_PresentParameters.AutoDepthStencilFormat))
+		{
+			return false;
+		}
+	}
+
+	if (_PresentParameters.AutoDepthStencilFormat == D3DFMT_UNKNOWN) {
+		if (BitDepth == 32) {
+			_PresentParameters.AutoDepthStencilFormat = D3DFMT_D32;
+		} else {
+			_PresentParameters.AutoDepthStencilFormat = D3DFMT_D16;
+		}
+	}
+
+	if (MultiSampleAntiAliasing > D3DMULTISAMPLE_NONE) {
+		HRESULT hrBack = D3DInterface->CheckDeviceMultiSampleType(
+			CurRenderDevice,
+			D3DDEVTYPE_HAL,
+			_PresentParameters.BackBufferFormat,
+			d3d_windowed,
+			MultiSampleAntiAliasing
+		);
+
+		HRESULT hrDepth = D3DInterface->CheckDeviceMultiSampleType(
+			CurRenderDevice,
+			D3DDEVTYPE_HAL,
+			_PresentParameters.AutoDepthStencilFormat,
+			d3d_windowed,
+			MultiSampleAntiAliasing
+		);
+
+		if (FAILED(hrBack) || FAILED(hrDepth)) {
+			WWDEBUG_SAY(("Requested MSAA Mode Not Supported"));
+			MultiSampleAntiAliasing = D3DMULTISAMPLE_NONE;
+		}
+	}
+
+	_PresentParameters.MultiSampleType = MultiSampleAntiAliasing;
+	return true;
+}
+
 bool DX8Wrapper::Set_Render_Device(int dev, int width, int height, int bits, int windowed,
 								   bool resize_window,bool reset_device, bool restore_assets)
 {
@@ -974,170 +1273,66 @@ bool DX8Wrapper::Set_Render_Device(int dev, int width, int height, int bits, int
 		_RenderDeviceNameTable[CurRenderDevice].str(),_RenderDeviceDescriptionTable[CurRenderDevice].Get_Driver_Name(),
 		_RenderDeviceDescriptionTable[CurRenderDevice].Get_Driver_Version(),ResolutionWidth,ResolutionHeight,(IsWindowed ? 1 : 0)));
 
-#ifdef _WIN32
-	// PWG 4/13/2000 - changed so that if you say to resize the window it resizes
-	// regardless of whether its windowed or not as OpenGL resizes its self around
-	// the caption and edges of the window type you provide, so its important to
-	// push the client area to be the size you really want.
-	// if ( resize_window && windowed ) {
-	if (resize_window) {
-		Resize_And_Position_Window();
-	}
-#endif
 	//must be either resetting existing device or creating a new one.
 	WWASSERT(reset_device || D3DDevice == nullptr);
 
-	/*
-	** Initialize values for D3DPRESENT_PARAMETERS members.
-	*/
-	::ZeroMemory(&_PresentParameters, sizeof(D3DPRESENT_PARAMETERS));
+	const D3DMULTISAMPLE_TYPE requested_msaa = MultiSampleAntiAliasing;
+	const int requested_bits = BitDepth;
 
-	_PresentParameters.BackBufferWidth = ResolutionWidth;
-	_PresentParameters.BackBufferHeight = ResolutionHeight;
-	_PresentParameters.BackBufferCount = IsWindowed ? 1 : 2;
-
-	//I changed this to discard all the time (even when full-screen) since that the most efficient. 07-16-03 MW:
-	_PresentParameters.SwapEffect = D3DSWAPEFFECT_DISCARD;//IsWindowed ? D3DSWAPEFFECT_DISCARD : D3DSWAPEFFECT_FLIP;		// Shouldn't this be D3DSWAPEFFECT_FLIP?
-	_PresentParameters.hDeviceWindow = _Hwnd;
-	_PresentParameters.Windowed = IsWindowed;
-
-	_PresentParameters.EnableAutoDepthStencil = TRUE;				// Driver will attempt to match Z-buffer depth
-	_PresentParameters.Flags=0;											// We're not going to lock the backbuffer
-
-	_PresentParameters.FullScreen_PresentationInterval = D3DPRESENT_INTERVAL_DEFAULT;
-	_PresentParameters.FullScreen_RefreshRateInHz = D3DPRESENT_RATE_DEFAULT;
-
-	/*
-	** Set up the buffer formats.  Several issues here:
-	** - if in windowed mode, the backbuffer must use the current display format.
-	** - the depth buffer must use
-	*/
-	if (IsWindowed) {
-
-		D3DDISPLAYMODE desktop_mode;
-		::ZeroMemory(&desktop_mode, sizeof(D3DDISPLAYMODE));
-		D3DInterface->GetAdapterDisplayMode( CurRenderDevice, &desktop_mode );
-
-		DisplayFormat=_PresentParameters.BackBufferFormat = desktop_mode.Format;
-
-		// In windowed mode, define the bitdepth from desktop mode (as it can't be changed)
-		switch (_PresentParameters.BackBufferFormat) {
-		case D3DFMT_X8R8G8B8:
-		case D3DFMT_A8R8G8B8:
-		case D3DFMT_R8G8B8: BitDepth=32; break;
-		case D3DFMT_A4R4G4B4:
-		case D3DFMT_A1R5G5B5:
-		case D3DFMT_R5G6B5: BitDepth=16; break;
-		case D3DFMT_L8:
-		case D3DFMT_A8:
-		case D3DFMT_P8: BitDepth=8; break;
-		default:
-			// Unknown backbuffer format probably means the device can't do windowed
-			return false;
+	bool ret = false;
+	if (Configure_Present_Parameters(false)) {
+#ifdef _WIN32
+		if (resize_window) {
+			Resize_And_Position_Window();
 		}
+#endif
+		StringClass displayFormat;
+		StringClass backbufferFormat;
+		Get_Format_Name(DisplayFormat, &displayFormat);
+		Get_Format_Name(_PresentParameters.BackBufferFormat, &backbufferFormat);
+		WWDEBUG_SAY(("Using Display/BackBuffer Formats: %s/%s", displayFormat.str(), backbufferFormat.str()));
 
-		if (BitDepth==32 && D3DInterface->CheckDeviceType(0,D3DDEVTYPE_HAL,desktop_mode.Format,D3DFMT_A8R8G8B8, TRUE) == D3D_OK)
-		{
-			//promote 32-bit modes to include destination alpha
-			_PresentParameters.BackBufferFormat = D3DFMT_A8R8G8B8;
+		if (reset_device) {
+			WWDEBUG_SAY(("DX8Wrapper::Set_Render_Device is resetting the device."));
+			ret = Reset_Device(restore_assets);
+		} else {
+			ret = Create_Device();
 		}
+	}
 
-		/*
-		** Find a appropriate Z buffer
-		*/
-		if (!Find_Z_Mode(DisplayFormat,_PresentParameters.BackBufferFormat,&_PresentParameters.AutoDepthStencilFormat))
-		{
-			// If opening 32 bit mode failed, try 16 bit, even if the desktop happens to be 32 bit
-			if (BitDepth==32) {
-				BitDepth=16;
-				_PresentParameters.BackBufferFormat=D3DFMT_R5G6B5;
-				if (!Find_Z_Mode(_PresentParameters.BackBufferFormat,_PresentParameters.BackBufferFormat,&_PresentParameters.AutoDepthStencilFormat)) {
-					_PresentParameters.AutoDepthStencilFormat=D3DFMT_UNKNOWN;
-				}
+	// If exclusive fullscreen failed (e.g. resolution like 1920x1440 is not exposed by the AMD/Intel driver
+	// in EnumAdapterModes), seamlessly fall back to a borderless fullscreen windowed D3D8 swapchain.
+	if (!ret && !IsWindowed) {
+		WWDEBUG_SAY(("Exclusive fullscreen %dx%d unavailable on adapter; falling back to borderless fullscreen.",
+			ResolutionWidth, ResolutionHeight));
+		MultiSampleAntiAliasing = requested_msaa;
+		BitDepth = requested_bits;
+
+		if (Configure_Present_Parameters(true)) {
+#ifdef _WIN32
+			Resize_And_Position_Window();
+#endif
+			if (reset_device) {
+				ret = Reset_Device(restore_assets);
+			} else {
+				ret = Create_Device();
 			}
-			else {
-				_PresentParameters.AutoDepthStencilFormat=D3DFMT_UNKNOWN;
+#ifdef _WIN32
+			if (ret) {
+				Resize_And_Position_Window();
 			}
-		}
-
-	} else {
-
-		/*
-		** Try to find a mode that matches the user's desired bit-depth.
-		*/
-		Find_Color_And_Z_Mode(ResolutionWidth,ResolutionHeight,BitDepth,&DisplayFormat,
-			&_PresentParameters.BackBufferFormat,&_PresentParameters.AutoDepthStencilFormat);
-	}
-
-	/*
-	** Set default for depth stencil format if auto Z buffer failed.
-	*/
-	if (_PresentParameters.AutoDepthStencilFormat==D3DFMT_UNKNOWN) {
-		if (BitDepth==32) {
-			_PresentParameters.AutoDepthStencilFormat=D3DFMT_D32;
-		}
-		else {
-			_PresentParameters.AutoDepthStencilFormat=D3DFMT_D16;
+#endif
 		}
 	}
 
-	/*
-	** Check the devices support for the requested MSAA mode then setup the multi sample type
-	*/
-	if (MultiSampleAntiAliasing > D3DMULTISAMPLE_NONE) {
+	WWDEBUG_SAY(("Reset/Create_Device done, reset_device=%d, restore_assets=%d, borderless=%d",
+		reset_device, restore_assets, IsBorderlessFullscreen ? 1 : 0));
 
-		HRESULT hrBack = D3DInterface->CheckDeviceMultiSampleType(
-			CurRenderDevice,
-			D3DDEVTYPE_HAL,
-			_PresentParameters.BackBufferFormat,
-			IsWindowed,
-			MultiSampleAntiAliasing
-		);
-
-		HRESULT hrDepth = D3DInterface->CheckDeviceMultiSampleType(
-			CurRenderDevice,
-			D3DDEVTYPE_HAL,
-			_PresentParameters.AutoDepthStencilFormat,
-			IsWindowed,
-			MultiSampleAntiAliasing
-		);
-
-		if (FAILED(hrBack) || FAILED(hrDepth)) {
-			// IF we fail then disable MSAA entirely.
-			// External code needs to retrieve the configured MSAA mode after device creation
-			WWDEBUG_SAY(("Requested MSAA Mode Not Supported"));
-			MultiSampleAntiAliasing = D3DMULTISAMPLE_NONE;
-		}
-	}
-
-	_PresentParameters.MultiSampleType = MultiSampleAntiAliasing;
-
-	/*
-	** Time to actually create the device.
-	*/
-	StringClass displayFormat;
-	StringClass backbufferFormat;
-
-	Get_Format_Name(DisplayFormat,&displayFormat);
-	Get_Format_Name(_PresentParameters.BackBufferFormat,&backbufferFormat);
-
-	WWDEBUG_SAY(("Using Display/BackBuffer Formats: %s/%s",displayFormat.str(),backbufferFormat.str()));
-
-	bool ret;
-
-	if (reset_device)
-	{
-		WWDEBUG_SAY(("DX8Wrapper::Set_Render_Device is resetting the device."));
-		ret = Reset_Device(restore_assets);	//reset device without restoring data - we're likely switching out of the app.
-	}
-	else
-		ret = Create_Device();
-
-	WWDEBUG_SAY(("Reset/Create_Device done, reset_device=%d, restore_assets=%d", reset_device, restore_assets));
-
-	if (ret)
-	{
+	if (ret) {
 		Render2DClass::Set_Screen_Resolution( RectClass( 0, 0, ResolutionWidth, ResolutionHeight ) );
+	} else {
+		Destroy_Backdrop_Window();
+		IsBorderlessFullscreen = false;
 	}
 
 	return ret;
@@ -1264,20 +1459,72 @@ const char * DX8Wrapper::Get_Render_Device_Name(int device_index)
 bool DX8Wrapper::Set_Device_Resolution(int width,int height,int bits,int windowed, bool resize_window)
 {
 	if (D3DDevice != nullptr) {
+		const int oldWidth = ResolutionWidth;
+		const int oldHeight = ResolutionHeight;
+		const int oldBits = BitDepth;
+		const bool oldWindowed = IsWindowed;
+		const bool oldBorderless = IsBorderlessFullscreen;
+		const D3DFORMAT oldDisplayFormat = DisplayFormat;
+		const D3DMULTISAMPLE_TYPE requestedMsaa = MultiSampleAntiAliasing;
+		const D3DPRESENT_PARAMETERS oldPP = _PresentParameters;
 
 		if (width != -1) {
-			_PresentParameters.BackBufferWidth = ResolutionWidth = width;
+			ResolutionWidth = width;
 		}
 		if (height != -1) {
-			_PresentParameters.BackBufferHeight = ResolutionHeight = height;
+			ResolutionHeight = height;
 		}
-		if (resize_window)
-		{
-			Resize_And_Position_Window();
+		if (bits != -1) {
+			BitDepth = bits;
 		}
-#pragma message("TODO: support changing windowed status and changing the bit depth")
-		WWDEBUG_SAY(("DX8Wrapper::Set_Device_Resolution is resetting the device."));
-		return Reset_Device();
+		if (windowed != -1) {
+			IsWindowed = (windowed != 0);
+			DX8Wrapper_IsWindowed = IsWindowed;
+		}
+
+		const int targetBits = BitDepth;
+		bool ok = false;
+
+		if (Configure_Present_Parameters(false)) {
+			if (resize_window) {
+				Resize_And_Position_Window();
+			}
+			WWDEBUG_SAY(("DX8Wrapper::Set_Device_Resolution is resetting the device."));
+			ok = Reset_Device();
+		}
+
+		// Seamless borderless fullscreen fallback when switching to a resolution not exposed by the driver (e.g. 1920x1440 on AMD)
+		if (!ok && !IsWindowed) {
+			MultiSampleAntiAliasing = requestedMsaa;
+			BitDepth = targetBits;
+			if (Configure_Present_Parameters(true)) {
+				// If leaving exclusive fullscreen, Reset_Device restores desktop resolution first; position both before and after.
+				ok = Reset_Device();
+				if (ok) {
+					Resize_And_Position_Window();
+				}
+			}
+		}
+
+		if (ok) {
+			if (resize_window || IsBorderlessFullscreen) {
+				Resize_And_Position_Window();
+			}
+			Render2DClass::Set_Screen_Resolution(RectClass(0, 0, ResolutionWidth, ResolutionHeight));
+			return true;
+		}
+
+		// Restore previous parameters cleanly on failure
+		ResolutionWidth = oldWidth;
+		ResolutionHeight = oldHeight;
+		BitDepth = oldBits;
+		IsWindowed = oldWindowed;
+		DX8Wrapper_IsWindowed = oldWindowed;
+		IsBorderlessFullscreen = oldBorderless;
+		DisplayFormat = oldDisplayFormat;
+		MultiSampleAntiAliasing = requestedMsaa;
+		_PresentParameters = oldPP;
+		return false;
 	} else {
 		return false;
 	}
@@ -1529,13 +1776,14 @@ bool DX8Wrapper::Find_Color_Mode(D3DFORMAT colorbuffer, int resx, int resy, UINT
 
 	bool found=false;
 
-	modemax=D3DInterface->GetAdapterModeCount(D3DADAPTER_DEFAULT);
+	const UINT adapter = (CurRenderDevice >= 0) ? static_cast<UINT>(CurRenderDevice) : D3DADAPTER_DEFAULT;
+	modemax=D3DInterface->GetAdapterModeCount(adapter);
 
 	i=0;
 
 	while (i<modemax && !found)
 	{
-		D3DInterface->EnumAdapterModes(D3DADAPTER_DEFAULT, i, &dmode);
+		D3DInterface->EnumAdapterModes(adapter, i, &dmode);
 		if (dmode.Width==rx && dmode.Height==ry && dmode.Format==colorbuffer) {
 			WWDEBUG_SAY(("Found valid color mode.  Width = %d Height = %d Format = %d",dmode.Width,dmode.Height,dmode.Format));
 			found=true;
@@ -1557,7 +1805,7 @@ bool DX8Wrapper::Find_Color_Mode(D3DFORMAT colorbuffer, int resx, int resy, UINT
 	j=i;
 	while (j<modemax && stillok)
 	{
-		D3DInterface->EnumAdapterModes(D3DADAPTER_DEFAULT, j, &dmode);
+		D3DInterface->EnumAdapterModes(adapter, j, &dmode);
 		if (dmode.Width==rx && dmode.Height==ry && dmode.Format==colorbuffer)
 			stillok=true; else stillok=false;
 		j++;
@@ -1623,8 +1871,9 @@ bool DX8Wrapper::Find_Z_Mode(D3DFORMAT colorbuffer,D3DFORMAT backbuffer, D3DFORM
 
 bool DX8Wrapper::Test_Z_Mode(D3DFORMAT colorbuffer,D3DFORMAT backbuffer, D3DFORMAT zmode)
 {
+	const UINT adapter = (CurRenderDevice >= 0) ? static_cast<UINT>(CurRenderDevice) : D3DADAPTER_DEFAULT;
 	// See if we have this mode first
-	if (FAILED(D3DInterface->CheckDeviceFormat(D3DADAPTER_DEFAULT,WW3D_DEVTYPE,
+	if (FAILED(D3DInterface->CheckDeviceFormat(adapter,WW3D_DEVTYPE,
 		colorbuffer,D3DUSAGE_DEPTHSTENCIL,D3DRTYPE_SURFACE,zmode)))
 	{
 		WWDEBUG_SAY(("CheckDeviceFormat failed.  Colorbuffer format = %d  Zbufferformat = %d",colorbuffer,zmode));
@@ -1632,7 +1881,7 @@ bool DX8Wrapper::Test_Z_Mode(D3DFORMAT colorbuffer,D3DFORMAT backbuffer, D3DFORM
 	}
 
 	// Then see if it matches the color buffer
-	if(FAILED(D3DInterface->CheckDepthStencilMatch(D3DADAPTER_DEFAULT, WW3D_DEVTYPE,
+	if(FAILED(D3DInterface->CheckDepthStencilMatch(adapter, WW3D_DEVTYPE,
 		colorbuffer,backbuffer,zmode)))
 	{
 		WWDEBUG_SAY(("CheckDepthStencilMatch failed.  Colorbuffer format = %d  Backbuffer format = %d Zbufferformat = %d",colorbuffer,backbuffer,zmode));
@@ -1736,7 +1985,7 @@ void DX8Wrapper::Flip_To_Primary()
 	// If we are fullscreen and the current frame is odd then we need
 	// to force a page flip to ensure that the first buffer in the flipping
 	// chain is the one visible.
-	if (!IsWindowed) {
+	if (!IsWindowed && !IsBorderlessFullscreen) {
 		DX8_Assert();
 
 		int numBuffers = (_PresentParameters.BackBufferCount + 1);
@@ -3579,6 +3828,9 @@ unsigned int DX8Wrapper::Get_Free_Texture_RAM()
 // Contrast - controls the difference between the maximum and the minimum of the curve
 void DX8Wrapper::Set_Gamma(float gamma,float bright,float contrast,bool calibrate,bool uselimit)
 {
+	if (IsWindowed || IsBorderlessFullscreen) {
+		return;
+	}
 	gamma=Bound(gamma,0.6f,6.0f);
 	bright=Bound(bright,-0.5f,0.5f);
 	contrast=Bound(contrast,0.5f,2.0f);

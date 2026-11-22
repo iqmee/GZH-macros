@@ -119,6 +119,7 @@ private:
 
 	void reset_resolution_list()					{ ResArray.Delete_All(); }
 	void add_resolution(int w,int h,int bits);
+	void sort_resolutions();
 
 	StringClass			DeviceName;
 	StringClass			DeviceVendor;
@@ -156,5 +157,23 @@ inline void RenderDeviceDescClass::add_resolution(int w,int h,int bits)
 
 	if (!found) {
 		ResArray.Add(ResolutionDescClass(w,h,bits));
+	}
+}
+
+inline void RenderDeviceDescClass::sort_resolutions()
+{
+	// Simple insertion sort by (Width, Height, BitDepth) ascending for clean dropdown ordering
+	for (int i = 1; i < ResArray.Count(); ++i) {
+		ResolutionDescClass key = ResArray[i];
+		int j = i - 1;
+		while (j >= 0 && (
+			ResArray[j].Width > key.Width ||
+			(ResArray[j].Width == key.Width && ResArray[j].Height > key.Height) ||
+			(ResArray[j].Width == key.Width && ResArray[j].Height == key.Height && ResArray[j].BitDepth > key.BitDepth)))
+		{
+			ResArray[j + 1] = ResArray[j];
+			--j;
+		}
+		ResArray[j + 1] = key;
 	}
 }
