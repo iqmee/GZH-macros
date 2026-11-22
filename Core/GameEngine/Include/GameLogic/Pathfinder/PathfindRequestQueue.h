@@ -38,6 +38,10 @@ public:
 	Bool empty() const { return m_count == 0; }
 	size_t size() const { return m_count; }
 	size_t capacity() const { return m_ring.size(); }
+	ObjectID peekAt(size_t index) const
+	{
+		return (index < m_count) ? m_ring[(m_head + index) & (m_ring.size() - 1)] : INVALID_ID;
+	}
 
 	Bool contains(ObjectID id) const;
 	Bool enqueue(ObjectID id);

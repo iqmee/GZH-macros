@@ -2238,6 +2238,7 @@ void Pathfinder::processPathfindQueue()
 		}
 	}
 #else
+	prepareFlowFieldsForQueue();
 	ObjectID queuedID = INVALID_ID;
 	while (m_cumulativeCellsAllocated < static_cast<Int>(PATHFIND_CELLS_PER_FRAME) &&
 		m_pathfindQueue.dequeue(queuedID)) {
@@ -2657,6 +2658,185 @@ Int Pathfinder::examineNeighboringCells(PathfindCell *parentCell, PathfindCell *
 
 
 #if !RETAIL_COMPATIBLE_PATHFINDING
+/**
+ * Pre-scans queued pathfinding requests in deterministic FIFO order to identify
+ * shared destination clusters demanded by multiple units in this frame. Builds all
+ * needed Flow Fields in parallel across worker threads from an immutable snapshot,
+ * then commits them deterministically before units run doPathfind().
+ */
+void Pathfinder::prepareFlowFieldsForQueue()
+{
+	if (!m_isMapReady || m_map == nullptr) {
+		return;
+	}
+
+	const size_t queueLen = m_pathfindQueue.size();
+	if (queueLen < static_cast<size_t>(PathfindFlowFieldManager::ACTIVATION_THRESHOLD)) {
+		return;
+	}
+
+	struct CandidateGroup
+	{
+		PathfindFlowFieldManager::ParallelBuildJob job;
+		UnsignedInt burstCount;
+	};
+
+	CandidateGroup candidates[PathfindFlowFieldManager::CACHE_CAPACITY * 2];
+	size_t candidateCount = 0;
+
+	const UnsignedInt currentFrame = TheGameLogic ? TheGameLogic->getFrame() : 0;
+	const size_t maxInspect = (queueLen > 2048) ? 2048 : queueLen;
+
+	for (size_t i = 0; i < maxInspect; ++i) {
+		const ObjectID id = m_pathfindQueue.peekAt(i);
+		Object *obj = TheGameLogic->findObjectByID(id);
+		if (obj == nullptr || obj->getLayer() != LAYER_GROUND) {
+			continue;
+		}
+		if (obj->isKindOf(KINDOF_DOZER) || obj->isKindOf(KINDOF_CLIFF_JUMPER)) {
+			continue;
+		}
+
+		AIUpdateInterface *ai = obj->getAIUpdateInterface();
+		if (ai == nullptr || !ai->friend_isSimpleGroundPathRequest() || ai->getIgnoredObstacleID() != INVALID_ID) {
+			continue;
+		}
+
+		const Coord3D *rawTo = ai->friend_getRequestedDestination();
+		const Coord3D *from = obj->getPosition();
+		if (rawTo == nullptr || from == nullptr || (rawTo->x == 0.0f && rawTo->y == 0.0f)) {
+			continue;
+		}
+
+		Int radius = 0;
+		Bool centerInCell = true;
+		getRadiusAndCenter(obj, radius, centerInCell);
+
+		Coord3D adjustTo = *rawTo;
+		Coord3D clipFrom = *from;
+		clip(&clipFrom, &adjustTo);
+		if (!centerInCell) {
+			adjustTo.x += PATHFIND_CELL_SIZE_F / 2.0f;
+			adjustTo.y += PATHFIND_CELL_SIZE_F / 2.0f;
+		}
+
+		if (TheTerrainLogic->getLayerForDestination(&adjustTo) != LAYER_GROUND) {
+			continue;
+		}
+
+		ICoord2D startCoord;
+		ICoord2D goalCoord;
+		worldToCell(&clipFrom, &startCoord);
+		worldToCell(&adjustTo, &goalCoord);
+
+		const Int dx = (goalCoord.x > startCoord.x) ? (goalCoord.x - startCoord.x) : (startCoord.x - goalCoord.x);
+		const Int dy = (goalCoord.y > startCoord.y) ? (goalCoord.y - startCoord.y) : (startCoord.y - goalCoord.y);
+		if (dx <= 6 && dy <= 6) {
+			continue;
+		}
+
+		Bool isHuman = true;
+		if (obj->getControllingPlayer() && obj->getControllingPlayer()->getPlayerType() == PLAYER_COMPUTER) {
+			isHuman = false;
+		}
+
+		const IRegion2D &activeBounds =
+			(isHuman && m_logicalExtent.hi.x > m_logicalExtent.lo.x && m_logicalExtent.hi.y > m_logicalExtent.lo.y)
+			? m_logicalExtent
+			: m_extent;
+
+		if (startCoord.x < activeBounds.lo.x || startCoord.x > activeBounds.hi.x ||
+			startCoord.y < activeBounds.lo.y || startCoord.y > activeBounds.hi.y ||
+			goalCoord.x < activeBounds.lo.x || goalCoord.x > activeBounds.hi.x ||
+			goalCoord.y < activeBounds.lo.y || goalCoord.y > activeBounds.hi.y) {
+			continue;
+		}
+
+		const Bool isCrusher = obj->getCrusherLevel() > 0;
+		const LocomotorSurfaceTypeMask surfaces = ai->getLocomotorSet().getValidSurfaces();
+		PathfindCell *startCell = getCell(LAYER_GROUND, startCoord.x, startCoord.y);
+		PathfindCell *goalCell = getCell(LAYER_GROUND, goalCoord.x, goalCoord.y);
+		if (startCell == nullptr || goalCell == nullptr) {
+			continue;
+		}
+		if (!validMovementPosition(isCrusher, surfaces, startCell) ||
+			!validMovementPosition(isCrusher, surfaces, goalCell)) {
+			continue;
+		}
+
+		const zoneStorageType zone1 = m_zoneManager.getEffectiveZone(surfaces, isCrusher, startCell->getZone());
+		const zoneStorageType zone2 = m_zoneManager.getEffectiveZone(surfaces, isCrusher, goalCell->getZone());
+		if (zone1 != zone2 || zone2 == 0) {
+			continue;
+		}
+
+		PathfindFlowFieldManager::FlowFieldKey key;
+		key.goalClusterX = goalCoord.x >> PathfindFlowFieldManager::CLUSTER_SHIFT;
+		key.goalClusterY = goalCoord.y >> PathfindFlowFieldManager::CLUSTER_SHIFT;
+		key.goalZone = zone2;
+		key.acceptableSurfaces = surfaces;
+		key.isCrusher = isCrusher;
+		key.isHuman = isHuman;
+
+		if (m_flowFieldManager.hasCached(key)) {
+			continue;
+		}
+
+		size_t found = candidateCount;
+		for (size_t c = 0; c < candidateCount; ++c) {
+			if (candidates[c].job.key == key) {
+				found = c;
+				break;
+			}
+		}
+
+		if (found < candidateCount) {
+			++candidates[found].burstCount;
+		} else if (candidateCount < ARRAY_SIZE(candidates)) {
+			candidates[candidateCount].job.key = key;
+			candidates[candidateCount].job.bounds = activeBounds;
+			candidates[candidateCount].job.seedX = goalCoord.x;
+			candidates[candidateCount].job.seedY = goalCoord.y;
+			candidates[candidateCount].burstCount = 1;
+			++candidateCount;
+		}
+	}
+
+	PathfindFlowFieldManager::ParallelBuildJob jobs[PathfindFlowFieldManager::CACHE_CAPACITY];
+	size_t jobCount = 0;
+	for (size_t c = 0; c < candidateCount && jobCount < PathfindFlowFieldManager::CACHE_CAPACITY; ++c) {
+		const UnsignedInt totalDemand = candidates[c].burstCount
+			+ m_flowFieldManager.peekRecentDemand(candidates[c].job.key, currentFrame);
+		if (totalDemand >= static_cast<UnsignedInt>(PathfindFlowFieldManager::ACTIVATION_THRESHOLD)) {
+			jobs[jobCount++] = candidates[c].job;
+		}
+	}
+
+	if (jobCount == 0) {
+		return;
+	}
+
+	// Capture a single immutable 1-byte-per-cell snapshot for lock-free worker reads.
+	const Int width = m_extent.hi.x + 1;
+	const Int height = m_extent.hi.y + 1;
+	const size_t totalCells = static_cast<size_t>(width) * static_cast<size_t>(height);
+	std::vector<UnsignedByte> &snapshot = m_flowFieldManager.getSnapshotScratch(totalCells);
+
+	for (Int x = 0; x < width; ++x) {
+		PathfindCell *col = m_map[x];
+		UnsignedByte *dstCol = &snapshot[static_cast<size_t>(x) * static_cast<size_t>(height)];
+		for (Int y = 0; y < height; ++y) {
+			PathfindCell *c = &col[y];
+			dstCol[y] = PathfindFlowFieldManager::encodeSnapshotCell(
+				static_cast<UnsignedByte>(c->getType()),
+				c->getPinched(),
+				c->isObstacleFence());
+		}
+	}
+
+	m_flowFieldManager.buildFlowFieldsParallel(jobs, jobCount, width, height, snapshot.data());
+}
+
 /**
  * Attempts to construct a native Path using the deterministic LRU-cached Flow Field
  * engine when multiple units target the same destination cluster and terrain zone.

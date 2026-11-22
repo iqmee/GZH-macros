@@ -260,6 +260,7 @@ public:
 protected:
 	virtual Path *internalFindPath( Object *obj, const LocomotorSet& locomotorSet, const Coord3D *from, const Coord3D *to);	///< Find a short, valid path between given locations
 #if !RETAIL_COMPATIBLE_PATHFINDING
+	void prepareFlowFieldsForQueue();
 	Path *tryFindPathViaFlowField( Object *obj, const LocomotorSet& locomotorSet, Bool isHuman, const Coord3D *from, const Coord3D *rawTo );
 #endif
 	Path *findHierarchicalPath( Bool isHuman, const LocomotorSet& locomotorSet, const Coord3D *from, const Coord3D *to, Bool crusher);

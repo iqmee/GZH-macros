@@ -653,9 +653,15 @@ public:
 
 	// this is intended for use ONLY by AIFollowPathState.
 	void friend_setCurrentGoalPathIndex( Int index ) { m_nextGoalPathIndex = index; }
-#ifdef DEBUG_LOGGING
+#if defined(DEBUG_LOGGING) || !RETAIL_COMPATIBLE_PATHFINDING
 	inline const Coord3D *friend_getRequestedDestination() const { return &m_requestedDestination; }
 	inline const Coord3D *friend_getRequestedDestination2() const { return &m_requestedDestination2; }
+#endif
+#if !RETAIL_COMPATIBLE_PATHFINDING
+	inline Bool friend_isSimpleGroundPathRequest() const
+	{
+		return m_waitingForPath && !m_isSafePath && !m_isAttackPath && !m_isApproachPath && !m_isBlockedAndStuck;
+	}
 #endif
 
 	Object* getGoalObject() { return getStateMachine()->getGoalObject(); }	///< return the id of the current state of the machine

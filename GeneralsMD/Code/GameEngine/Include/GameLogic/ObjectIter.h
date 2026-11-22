@@ -28,6 +28,7 @@
 
 #pragma once
 
+#include <vector>
 #include "Common/GameType.h"
 #include "Common/GameMemory.h"
 
@@ -92,31 +93,26 @@ class SimpleObjectIterator : public ObjectIterator
 	MEMORY_POOL_GLUE_WITH_USERLOOKUP_CREATE(SimpleObjectIterator, "SimpleObjectIteratorPool" )
 private:
 
-	class Clump : public MemoryPoolObject
+	struct ClumpEntry
 	{
-		MEMORY_POOL_GLUE_WITH_USERLOOKUP_CREATE(Clump, "SimpleObjectIteratorClumpPool" )
-	public:
-
-		Clump			*m_nextClump;
 		Object		*m_obj;
 		Real			m_numeric;	// typically, dist-squared
-
-		Clump();
-	//~Clump();
 	};
 
-	typedef Real (*ClumpCompareProc)(Clump *a, Clump *b);
-	static ClumpCompareProc theClumpCompareProcs[];
+	enum { INLINE_ENTRY_CAPACITY = 32 };
 
-	static Real sortNearToFar(Clump *a, Clump *b);
-	static Real sortFarToNear(Clump *a, Clump *b);
-	static Real sortCheapToExpensive(Clump *a, Clump *b);
-	static Real sortExpensiveToCheap(Clump *a, Clump *b);
+	static Bool compareNearToFar(const ClumpEntry &a, const ClumpEntry &b);
+	static Bool compareFarToNear(const ClumpEntry &a, const ClumpEntry &b);
+	static Bool compareCheapToExpensive(const ClumpEntry &a, const ClumpEntry &b);
+	static Bool compareExpensiveToCheap(const ClumpEntry &a, const ClumpEntry &b);
 
+	ClumpEntry *entryData() { return m_overflowEntries.empty() ? m_inlineEntries : m_overflowEntries.data(); }
+	const ClumpEntry *entryData() const { return m_overflowEntries.empty() ? m_inlineEntries : m_overflowEntries.data(); }
 
-	Clump				*m_firstClump;
-	Clump				*m_curClump;
-	Int					m_clumpCount;
+	ClumpEntry								m_inlineEntries[INLINE_ENTRY_CAPACITY];
+	std::vector<ClumpEntry>		m_overflowEntries;
+	Int												m_clumpCount;
+	Int												m_curIndex;
 
 	void reset();
 

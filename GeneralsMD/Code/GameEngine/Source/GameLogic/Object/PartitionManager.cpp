@@ -976,38 +976,56 @@ class PartitionContactList
 {
 private:
 
-	/*
-		socketcount should be prime (and "not too close to a power of 2) for best results.
+	enum
+	{
+		BUCKET_COUNT = 16384,
+		BUCKET_MASK = BUCKET_COUNT - 1
+	};
 
-		if this one isn't large enough, try this website:
-		http://www.utm.edu/research/primes/lists/small/1000.txt
+	struct ContactEntry
+	{
+		PartitionData *m_obj;
+		PartitionData *m_other;
+		Int m_nextInBucket;
+	};
 
-		So how is this chosen? Eh, pretty much based on experimentation.
-	*/
-	enum { PartitionContactList_SOCKET_COUNT = 5381 };
+	Int m_bucketHead[BUCKET_COUNT];
+	UnsignedInt m_bucketGen[BUCKET_COUNT];
+	UnsignedInt m_currentGen;
+	std::vector<ContactEntry> m_entries;
 
-
-	PartitionContactListNode* m_contactHash[PartitionContactList_SOCKET_COUNT];
-	PartitionContactListNode* m_contactList;
+	static inline UnsignedInt hashPair(UnsignedInt idA, UnsignedInt idB)
+	{
+		if (idA > idB)
+		{
+			UnsignedInt tmp = idA;
+			idA = idB;
+			idB = tmp;
+		}
+		UnsignedInt h = (idA * 0x9e3779b1u) ^ (idB + 0x85ebca77u);
+		h ^= h >> 16;
+		h *= 0x7feb352du;
+		h ^= h >> 15;
+		return h & BUCKET_MASK;
+	}
 
 public:
 
 	PartitionContactList()
+		: m_currentGen(1)
 	{
-		memset(m_contactHash, 0, sizeof(m_contactHash));
-		m_contactList = nullptr;
+		memset(m_bucketGen, 0, sizeof(m_bucketGen));
+		m_entries.reserve(2048);
 	}
 
 	~PartitionContactList()
 	{
-		resetContactList();
+		m_entries.clear();
 	}
 
 	/**
 		add a pair of objects to the contact list. If the pair is already
 		present (in either this order or reverse order), nothing is done.
-		Note that it is OK for other==null (this indicates a collisions with
-		the ground) but it is not OK for obj==null.
 	*/
 	void addToContactList(PartitionData *obj, PartitionData *other);
 
@@ -1019,7 +1037,7 @@ public:
 	void processContactList();
 
 	/**
-		discard the contents of the contact list.
+		discard the contents of the contact list in O(1) via generation counter.
 	*/
 	void resetContactList();
 
@@ -1438,6 +1456,8 @@ void PartitionCell::friend_addToCellList(CellAndObjectIntersection *coi)
 	{
 		coi->friend_addToCellList(&m_firstCoiInCell);
 		++m_coiCount;
+		if (ThePartitionManager)
+			ThePartitionManager->friend_updateCellOccupancy(m_cellX, m_cellY, m_firstCoiInCell);
 	}
 }
 
@@ -1448,6 +1468,8 @@ void PartitionCell::friend_removeFromCellList(CellAndObjectIntersection *coi)
 	{
 		coi->friend_removeFromCellList(&m_firstCoiInCell);
 		--m_coiCount;
+		if (ThePartitionManager)
+			ThePartitionManager->friend_updateCellOccupancy(m_cellX, m_cellY, m_firstCoiInCell);
 	}
 }
 
@@ -1967,6 +1989,12 @@ void PartitionData::addPossibleCollisions(PartitionContactList *ctList)
 
 	//DEBUG_LOG(("adding possible collision for %s",getObject()->getTemplate()->getName().str()));
 
+	const Object *myObj = getObject();
+	if (myObj == nullptr || myObj->isKindOf(KINDOF_NO_COLLIDE) || myObj->getStatusBits().test(OBJECT_STATUS_NO_COLLISIONS))
+	{
+		return;
+	}
+
 	CellAndObjectIntersection *myCoi = m_coiArray;
 	for (Int i = m_coiInUseCount; i > 0; --i, ++myCoi)
 	{
@@ -1979,6 +2007,9 @@ void PartitionData::addPossibleCollisions(PartitionContactList *ctList)
 			PartitionData *that = coi->getModule();
 			if (this != that)
 			{
+				const Object *thatObj = that->getObject();
+				if (thatObj == nullptr || thatObj->isKindOf(KINDOF_NO_COLLIDE) || thatObj->getStatusBits().test(OBJECT_STATUS_NO_COLLISIONS))
+					continue;
 				ctList->addToContactList(this, that);
 			}
 		}
@@ -2419,93 +2450,50 @@ void PartitionContactList::addToContactList( PartitionData *obj, PartitionData *
 	if (obj_obj == nullptr || other_obj == nullptr)
 		return;
 
-	// compute hash index based on object's ids.
-	UnsignedInt hashValue = hash2ints(obj_obj->getID(), other_obj->getID());
-	hashValue %= PartitionContactList_SOCKET_COUNT;
+	const UnsignedInt bucket = hashPair(
+		static_cast<UnsignedInt>(obj_obj->getID()),
+		static_cast<UnsignedInt>(other_obj->getID()));
 
-	// make sure given hit has not already been recorded
-	for (PartitionContactListNode* cd = m_contactHash[ hashValue ]; cd; cd = cd->m_nextHash )
+	Int headIdx = -1;
+	if (m_bucketGen[bucket] == m_currentGen)
 	{
-		if ((cd->m_obj == obj && cd->m_other == other) ||
-				(cd->m_obj == other && cd->m_other == obj))
+		headIdx = m_bucketHead[bucket];
+		for (Int idx = headIdx; idx >= 0; idx = m_entries[idx].m_nextInBucket)
 		{
-			// already noted
-			return;
+			const ContactEntry &cd = m_entries[idx];
+			if ((cd.m_obj == obj && cd.m_other == other) ||
+				(cd.m_obj == other && cd.m_other == obj))
+			{
+				// already noted
+				return;
+			}
 		}
 	}
-
-	// new hit
-	PartitionContactListNode *ncd = newInstance(PartitionContactListNode);
-	ncd->m_obj = obj;
-	ncd->m_other = other;
-	ncd->m_hashValue = hashValue;
-
-	// add to hash table
-	ncd->m_nextHash = m_contactHash[ hashValue ];
-	m_contactHash[ hashValue ] = ncd;
-
-	// add to list of contacts for this frame
-	ncd->m_next = m_contactList;
-	m_contactList = ncd;
-
-
-#if 0
-
-Int depth = 0;
-for (PartitionContactListNode *cd2 = m_contactHash[ hashValue ]; cd2; cd2 = cd2->m_nextHash )
-{
-	depth++;
-}
-if (depth > 3)
-{
-	DEBUG_LOG(("depth is %d for %s %08lx (%d) - %s %08lx (%d)",
-		depth,obj_obj->getTemplate()->getName().str(),obj_obj,obj_obj->getID(),
-		other_obj->getTemplate()->getName().str(),other_obj,other_obj->getID()
-		));
-
-	for (cd2 = m_contactHash[ hashValue ]; cd2; cd2 = cd2->m_nextHash )
+	else
 	{
-		UnsignedInt rawhash = djb2hash2ints(cd2->m_obj->getObject()->getID(), cd2->m_other->getObject()->getID());
-		//hashValue %= PartitionContactList_SOCKET_COUNT;
-
-
-		DEBUG_LOG(("ENTRY: %s %08lx (%d) - %s %08lx (%d) [rawhash %d]",
-			cd2->m_obj->getObject()->getTemplate()->getName().str(),cd2->m_obj->getObject(),cd2->m_obj->getObject()->getID(),
-			cd2->m_other->getObject()->getTemplate()->getName().str(),cd2->m_other->getObject(),cd2->m_other->getObject()->getID(),
-			rawhash));
+		m_bucketGen[bucket] = m_currentGen;
 	}
-}
 
-static Real aggtotal = 0;
-static Real aggfull = 0;
-static Real aggcount = 0;
-for (int ii = 0; ii < PartitionContactList_SOCKET_COUNT; ++ii)
-{
-	if (m_contactHash[ii])
-		aggfull += 1.0f;
-
-	for (cd2 = m_contactHash[ ii ]; cd2; cd2 = cd2->m_nextHash )
-	{
-		aggtotal += 1.0f;
-	}
-}
-aggcount += 1.0f;
-DEBUG_ASSERTLOG(((Int)aggcount)%1000!=0,("avg hash depth at %f is %f, fullness %f%%",
-aggcount,aggtotal/(aggcount*PartitionContactList_SOCKET_COUNT),(aggfull*100)/(aggcount*PartitionContactList_SOCKET_COUNT)));
-#endif
-
-
+	const Int newIdx = static_cast<Int>(m_entries.size());
+	ContactEntry entry;
+	entry.m_obj = obj;
+	entry.m_other = other;
+	entry.m_nextInBucket = headIdx;
+	m_entries.push_back(entry);
+	m_bucketHead[bucket] = newIdx;
 }
 
 //-----------------------------------------------------------------------------
 void PartitionContactList::removeSpecificPartitionData(PartitionData* data)
 {
-	for (PartitionContactListNode* cd = m_contactList; cd; cd = cd->m_next)
+	const size_t count = m_entries.size();
+	ContactEntry *entries = m_entries.data();
+	for (size_t i = 0; i < count; ++i)
 	{
-		if (cd->m_obj == data || cd->m_other == data)
+		if (entries[i].m_obj == data || entries[i].m_other == data)
 		{
-			cd->m_obj = nullptr;
-			cd->m_other = nullptr;
+			entries[i].m_obj = nullptr;
+			entries[i].m_other = nullptr;
 		}
 	}
 }
@@ -2513,34 +2501,34 @@ void PartitionContactList::removeSpecificPartitionData(PartitionData* data)
 //-----------------------------------------------------------------------------
 void PartitionContactList::resetContactList()
 {
-	// remove items from hash table
-	PartitionContactListNode* cdnext;
-	for (PartitionContactListNode* cd = m_contactList; cd; cd = cdnext)
+	m_entries.clear();
+	++m_currentGen;
+	if (m_currentGen == 0)
 	{
-		cdnext = cd->m_next;
-		deleteInstance(cd);
+		memset(m_bucketGen, 0, sizeof(m_bucketGen));
+		m_currentGen = 1;
 	}
-
-	memset(m_contactHash, 0, sizeof(m_contactHash));
-	m_contactList = nullptr;
 }
 
 //-----------------------------------------------------------------------------
 void PartitionContactList::processContactList()
 {
-	for (PartitionContactListNode* cd = m_contactList; cd; cd = cd->m_next)
+	// Iterate in reverse insertion order to preserve exact original LIFO contact processing order.
+	for (Int idx = static_cast<Int>(m_entries.size()) - 1; idx >= 0; --idx)
 	{
-		if (cd->m_obj == nullptr || cd->m_other == nullptr)
+		PartitionData *pdObj = m_entries[idx].m_obj;
+		PartitionData *pdOther = m_entries[idx].m_other;
+		if (pdObj == nullptr || pdOther == nullptr)
 			continue;
 
 		// we know that their partitions overlap; determine if they REALLY collide
 		// before proceeding...
 		CollideLocAndNormal cinfo;
-		if (!cd->m_obj->friend_collidesWith(cd->m_other, &cinfo))
+		if (!pdObj->friend_collidesWith(pdOther, &cinfo))
 			continue;
 
-		Object* obj = cd->m_obj->getObject();
-		Object* other = cd->m_other->getObject();
+		Object* obj = pdObj->getObject();
+		Object* other = pdOther->getObject();
 
 		if( obj->getStatusBits().test( OBJECT_STATUS_NO_COLLISIONS ) ||
 				other->getStatusBits().test( OBJECT_STATUS_NO_COLLISIONS ) )
@@ -2552,8 +2540,8 @@ void PartitionContactList::processContactList()
 		// the onCollide() calls can remove the object(s) from the partition mgr,
 		// thus destroying the partitiondata for 'em. go ahead and null these out here
 		// so we won't be tempted to use 'em (since they might be bogus).
-		cd->m_obj = nullptr;
-		cd->m_other = nullptr;
+		m_entries[idx].m_obj = nullptr;
+		m_entries[idx].m_other = nullptr;
 
 		obj->onCollide(other, &cinfo.loc, &cinfo.normal);
 		flipCoord3D(&cinfo.normal);
@@ -2575,12 +2563,10 @@ void PartitionContactList::processContactList()
 		//
 		if (!obj->isDestroyed() && obj->friend_getPartitionData() != nullptr && !obj->isKindOf(KINDOF_IMMOBILE))
 		{
-//DEBUG_LOG(("%d: re-dirtying collision of %s %08lx with %s %08lx",TheGameLogic->getFrame(),obj->getTemplate()->getName().str(),obj,other->getTemplate()->getName().str(),other));
 			obj->friend_getPartitionData()->makeDirty(false);
 		}
 		if (!other->isDestroyed() && other->friend_getPartitionData() != nullptr && !other->isKindOf(KINDOF_IMMOBILE))
 		{
-//DEBUG_LOG(("%d: re-dirtying collision of %s %08lx with %s %08lx [other]",TheGameLogic->getFrame(),other->getTemplate()->getName().str(),other,obj->getTemplate()->getName().str(),obj));
 			other->friend_getPartitionData()->makeDirty(false);
 		}
 	}
@@ -2599,6 +2585,7 @@ PartitionManager::PartitionManager()
 	m_cellCountY = 0;
 	m_totalCellCount = 0;
 	m_cells = nullptr;
+	m_reusableContactList = nullptr;
 	m_worldExtents.lo.zero();
 	m_worldExtents.hi.zero();
 	m_dirtyModules = nullptr;
@@ -2613,6 +2600,8 @@ PartitionManager::~PartitionManager()
 {
 
 	shutdown();
+	delete m_reusableContactList;
+	m_reusableContactList = nullptr;
 
 }
 
@@ -2666,6 +2655,8 @@ void PartitionManager::init()
 		m_cellCountY = REAL_TO_INT_CEIL(m_worldExtents.height() * m_cellSizeInv);
 		m_totalCellCount = m_cellCountX * m_cellCountY;
 		m_cells = MSGNEW("PartitionManager_Cells") PartitionCell[m_totalCellCount];
+		m_nonEmptyCellBits.assign((m_totalCellCount + 31) >> 5, 0u);
+		m_cellCoiHeads.assign(m_totalCellCount, nullptr);
 		for (Int x = 0; x < m_cellCountX; x++)
 		{
 			for (Int y = 0; y < m_cellCountY; y++)
@@ -2754,6 +2745,8 @@ void PartitionManager::shutdown()
 
 	delete [] m_cells;
 	m_cells = nullptr;
+	m_nonEmptyCellBits.clear();
+	m_cellCoiHeads.clear();
 
 	m_cellSize = m_cellSizeInv = 0.0f;
 	m_cellCountX = 0;
@@ -2777,8 +2770,12 @@ void PartitionManager::update()
 			m_updatedSinceLastReset = true;
 		}
 
-		PartitionContactList ctList;
-		TheContactList = &ctList;
+		if (!m_reusableContactList)
+		{
+			m_reusableContactList = new PartitionContactList();
+		}
+		m_reusableContactList->resetContactList();
+		TheContactList = m_reusableContactList;
 		while (m_dirtyModules)
 		{
 #ifdef INTENSE_DEBUG
@@ -2805,15 +2802,16 @@ void PartitionManager::update()
 
 			if (collideEm && !dirty->getObject()->isKindOf(KINDOF_IMMOBILE))
 			{
-				dirty->addPossibleCollisions(&ctList);
+				dirty->addPossibleCollisions(m_reusableContactList);
 			}
 		}
 
-		ctList.processContactList();
+		m_reusableContactList->processContactList();
 #ifdef INTENSE_DEBUG
 		DEBUG_ASSERTLOG(cc==0,("updated partition info for %d objects",cc));
 #endif
 		TheContactList = nullptr;
+		m_reusableContactList->resetContactList();
 
 		processPendingUndoShroudRevealQueue();
 	}
@@ -3355,18 +3353,31 @@ Object *PartitionManager::getClosestObjects(
 		m_radiusVec[curRadius] contains a list of the cells (foo) that could
 		contain objects that are <= (curRadius * cellSize) distance away from cell (0,0).
 	*/
+	const UnsignedInt uCountX = static_cast<UnsignedInt>(m_cellCountX);
+	const UnsignedInt uCountY = static_cast<UnsignedInt>(m_cellCountY);
+	const UnsignedInt *nonEmptyBits = m_nonEmptyCellBits.data();
+	CellAndObjectIntersection * const *coiHeads = m_cellCoiHeads.data();
+
   for (Int curRadius = 0; curRadius <= maxRadiusLimit; ++curRadius)
   {
     const OffsetVec& offsets = m_radiusVec[curRadius];
 		if (offsets.empty())
 			continue;
-    for (OffsetVec::const_iterator it = offsets.begin(); it != offsets.end(); ++it)
+		const ICoord2D *offsetData = offsets.data();
+		const size_t offsetCount = offsets.size();
+    for (size_t oi = 0; oi < offsetCount; ++oi)
 		{
-			PartitionCell* thisCell = getCellAt(cellCenterX + it->x, cellCenterY + it->y);
-			if (thisCell == nullptr)
+			const Int cx = cellCenterX + offsetData[oi].x;
+			const Int cy = cellCenterY + offsetData[oi].y;
+			if (static_cast<UnsignedInt>(cx) >= uCountX || static_cast<UnsignedInt>(cy) >= uCountY)
 				continue;
 
-			for (CellAndObjectIntersection *thisCoi = thisCell->getFirstCoiInCell(); thisCoi; thisCoi = thisCoi->getNextCoi())
+			const Int cellIdx = cy * m_cellCountX + cx;
+			// L1-cache occupancy bitset test skips ~90% of empty cells without touching 216-byte PartitionCell.
+			if ((nonEmptyBits[cellIdx >> 5] & (1u << (cellIdx & 31))) == 0)
+				continue;
+
+			for (CellAndObjectIntersection *thisCoi = coiHeads[cellIdx]; thisCoi; thisCoi = thisCoi->getNextCoi())
 			{
 				PartitionData *thisMod = thisCoi->getModule();
 				Object *thisObj = thisMod->getObject();

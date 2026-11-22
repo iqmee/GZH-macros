@@ -17,6 +17,7 @@
 */
 
 #include "PreRTS.h"
+#include "GameLogic/Pathfinder/PathfindCell.h"
 #include "GameLogic/Pathfinder/PathfindConstants.h"
 #include "GameLogic/Pathfinder/PathfindFlowField.h"
 
@@ -53,12 +54,226 @@ namespace
 }
 
 PathfindFlowFieldManager::PathfindFlowFieldManager()
-	: m_mapVersion(1)
+	: m_poolStarted(false)
+	, m_poolShutdown(false)
+	, m_batchEpoch(0)
+	, m_activeJobs(nullptr)
+	, m_activeJobCount(0)
+	, m_activeWidth(0)
+	, m_activeHeight(0)
+	, m_activeSnapshot(nullptr)
+	, m_nextJobIndex(0)
+	, m_completedJobs(0)
+	, m_mapVersion(1)
 	, m_lruClock(0)
 {
+	// Always keep scratch[0] ready for the main thread even before workers spawn.
+	m_workerScratches.resize(1);
 	for (Int b = 0; b < DIAL_BUCKET_COUNT; ++b)
 	{
-		m_buckets[b].reserve(256);
+		m_workerScratches[0].buckets[b].reserve(256);
+	}
+}
+
+PathfindFlowFieldManager::~PathfindFlowFieldManager()
+{
+	shutdownWorkers();
+}
+
+void PathfindFlowFieldManager::ensureWorkersStarted()
+{
+	if (m_poolStarted)
+	{
+		return;
+	}
+	m_poolStarted = true;
+
+	unsigned int hwThreads = std::thread::hardware_concurrency();
+	if (hwThreads <= 1)
+	{
+		return;
+	}
+
+	unsigned int bgCount = hwThreads - 1;
+	if (bgCount > static_cast<unsigned int>(MAX_WORKER_THREADS))
+	{
+		bgCount = static_cast<unsigned int>(MAX_WORKER_THREADS);
+	}
+
+	// Resize scratches BEFORE spawning threads so references remain stable forever.
+	m_workerScratches.resize(static_cast<size_t>(bgCount) + 1);
+	for (size_t s = 0; s < m_workerScratches.size(); ++s)
+	{
+		for (Int b = 0; b < DIAL_BUCKET_COUNT; ++b)
+		{
+			m_workerScratches[s].buckets[b].reserve(256);
+		}
+	}
+
+	m_workers.reserve(bgCount);
+	for (unsigned int w = 0; w < bgCount; ++w)
+	{
+		const size_t scratchIndex = static_cast<size_t>(w) + 1;
+		m_workers.emplace_back(&PathfindFlowFieldManager::workerLoop, this, scratchIndex);
+	}
+}
+
+void PathfindFlowFieldManager::shutdownWorkers()
+{
+	if (m_workers.empty())
+	{
+		return;
+	}
+
+	{
+		std::lock_guard<std::mutex> lock(m_poolMutex);
+		m_poolShutdown = true;
+		++m_batchEpoch;
+	}
+	m_cvWork.notify_all();
+
+	for (size_t i = 0; i < m_workers.size(); ++i)
+	{
+		if (m_workers[i].joinable())
+		{
+			m_workers[i].join();
+		}
+	}
+	m_workers.clear();
+	m_poolStarted = false;
+	m_poolShutdown = false;
+}
+
+void PathfindFlowFieldManager::workerLoop(size_t scratchIndex)
+{
+	UnsignedInt seenEpoch = 0;
+	for (;;)
+	{
+		{
+			std::unique_lock<std::mutex> lock(m_poolMutex);
+			m_cvWork.wait(lock, [this, seenEpoch]()
+			{
+				return m_poolShutdown || m_batchEpoch != seenEpoch;
+			});
+
+			if (m_poolShutdown)
+			{
+				return;
+			}
+			seenEpoch = m_batchEpoch;
+		}
+
+		executeBatchJobs(scratchIndex);
+	}
+}
+
+UnsignedByte PathfindFlowFieldManager::decodePassabilityFromSnapshot(
+	UnsignedByte snap,
+	Bool isCrusher,
+	LocomotorSurfaceTypeMask acceptableSurfaces)
+{
+	Bool valid = false;
+	if (isCrusher && (snap & SNAP_FENCE) != 0)
+	{
+		valid = true;
+	}
+	else
+	{
+		LocomotorSurfaceTypeMask cellSurfaces = NO_SURFACES;
+		switch (static_cast<PathfindCell::CellType>(snap & SNAP_TYPE_MASK))
+		{
+			case PathfindCell::CELL_CLEAR:
+				cellSurfaces = LOCOMOTORSURFACE_GROUND | LOCOMOTORSURFACE_AIR;
+				break;
+			case PathfindCell::CELL_WATER:
+				cellSurfaces = LOCOMOTORSURFACE_WATER | LOCOMOTORSURFACE_AIR;
+				break;
+			case PathfindCell::CELL_CLIFF:
+				cellSurfaces = LOCOMOTORSURFACE_CLIFF | LOCOMOTORSURFACE_AIR;
+				break;
+			case PathfindCell::CELL_RUBBLE:
+				cellSurfaces = LOCOMOTORSURFACE_RUBBLE | LOCOMOTORSURFACE_AIR;
+				break;
+			case PathfindCell::CELL_OBSTACLE:
+			case PathfindCell::CELL_BRIDGE_IMPASSABLE:
+			case PathfindCell::CELL_IMPASSABLE:
+				cellSurfaces = LOCOMOTORSURFACE_AIR;
+				break;
+			default:
+				cellSurfaces = NO_SURFACES;
+				break;
+		}
+		valid = ((cellSurfaces & acceptableSurfaces) != 0);
+	}
+
+	if (!valid)
+	{
+		return PASS_BLOCKED;
+	}
+
+	return ((snap & SNAP_PINCHED) != 0) ? PASS_SOFT_PENALTY : PASS_CLEAR;
+}
+
+void PathfindFlowFieldManager::executeBatchJobs(size_t scratchIndex)
+{
+	WorkerScratch &scratch = m_workerScratches[scratchIndex];
+	const size_t totalCells = static_cast<size_t>(m_activeWidth) * static_cast<size_t>(m_activeHeight);
+
+	for (;;)
+	{
+		const size_t jobIdx = m_nextJobIndex.fetch_add(1, std::memory_order_relaxed);
+		if (jobIdx >= m_activeJobCount)
+		{
+			break;
+		}
+
+		const ParallelBuildJob &job = m_activeJobs[jobIdx];
+		ParallelJobResult &result = m_parallelResults[jobIdx];
+		result.key = job.key;
+		result.bounds = job.bounds;
+		result.seedX = job.seedX;
+		result.seedY = job.seedY;
+		result.width = m_activeWidth;
+		result.height = m_activeHeight;
+		result.valid = false;
+
+		if (scratch.passability.size() < totalCells)
+		{
+			scratch.passability.resize(totalCells);
+		}
+		std::fill(scratch.passability.begin(), scratch.passability.begin() + totalCells, static_cast<UnsignedByte>(PASS_BLOCKED));
+
+		const Int height = m_activeHeight;
+		const Bool isCrusher = job.key.isCrusher;
+		const LocomotorSurfaceTypeMask surfaces = job.key.acceptableSurfaces;
+
+		for (Int x = job.bounds.lo.x; x <= job.bounds.hi.x; ++x)
+		{
+			const size_t colOffset = static_cast<size_t>(x) * static_cast<size_t>(height);
+			const UnsignedByte *srcCol = m_activeSnapshot + colOffset;
+			UnsignedByte *dstCol = scratch.passability.data() + colOffset;
+			for (Int y = job.bounds.lo.y; y <= job.bounds.hi.y; ++y)
+			{
+				dstCol[y] = decodePassabilityFromSnapshot(srcCol[y], isCrusher, surfaces);
+			}
+		}
+
+		result.valid = runDialDijkstra(
+			m_activeWidth,
+			m_activeHeight,
+			job.bounds,
+			job.seedX,
+			job.seedY,
+			scratch.passability.data(),
+			scratch,
+			result.flowDir);
+
+		const size_t doneCount = m_completedJobs.fetch_add(1, std::memory_order_acq_rel) + 1;
+		if (doneCount == m_activeJobCount)
+		{
+			std::lock_guard<std::mutex> lock(m_poolMutex);
+			m_cvDone.notify_one();
+		}
 	}
 }
 
@@ -110,15 +325,50 @@ std::vector<UnsignedByte> &PathfindFlowFieldManager::getPassabilityScratch(size_
 	return m_passabilityScratch;
 }
 
-Bool PathfindFlowFieldManager::recordDemandAndShouldUse(const FlowFieldKey &key, UnsignedInt currentFrame)
+std::vector<UnsignedByte> &PathfindFlowFieldManager::getSnapshotScratch(size_t totalCells)
 {
-	// Fast path: if an up-to-date flow field is already cached for this key, use it immediately.
+	if (m_snapshotScratch.size() < totalCells)
+	{
+		m_snapshotScratch.resize(totalCells);
+	}
+	return m_snapshotScratch;
+}
+
+UnsignedInt PathfindFlowFieldManager::peekRecentDemand(const FlowFieldKey &key, UnsignedInt currentFrame) const
+{
+	for (Int i = 0; i < DEMAND_TABLE_SIZE; ++i)
+	{
+		const DemandSlot &slot = m_demand[i];
+		if (slot.mapVersion == m_mapVersion && slot.count > 0 && slot.key == key)
+		{
+			if (currentFrame >= slot.lastFrame && (currentFrame - slot.lastFrame) <= DEMAND_WINDOW_FRAMES)
+			{
+				return slot.count;
+			}
+			return 0;
+		}
+	}
+	return 0;
+}
+
+Bool PathfindFlowFieldManager::hasCached(const FlowFieldKey &key) const
+{
 	for (Int i = 0; i < CACHE_CAPACITY; ++i)
 	{
 		if (m_cache[i].mapVersion == m_mapVersion && m_cache[i].key == key)
 		{
 			return true;
 		}
+	}
+	return false;
+}
+
+Bool PathfindFlowFieldManager::recordDemandAndShouldUse(const FlowFieldKey &key, UnsignedInt currentFrame)
+{
+	// Fast path: if an up-to-date flow field is already cached for this key, use it immediately.
+	if (hasCached(key))
+	{
+		return true;
 	}
 
 	Int matchSlot = -1;
@@ -209,55 +459,46 @@ PathfindFlowFieldManager::FlowFieldEntry *PathfindFlowFieldManager::allocateSlot
 	return &m_cache[victimIndex];
 }
 
-const PathfindFlowFieldManager::FlowFieldEntry *PathfindFlowFieldManager::buildFlowField(
-	const FlowFieldKey &key,
+Bool PathfindFlowFieldManager::runDialDijkstra(
 	Int width,
 	Int height,
 	const IRegion2D &bounds,
 	Int seedX,
 	Int seedY,
-	const UnsignedByte *passabilityGrid)
+	const UnsignedByte *passabilityGrid,
+	WorkerScratch &scratch,
+	std::vector<signed char> &outFlowDir)
 {
 	if (width <= 0 || height <= 0 || passabilityGrid == nullptr)
 	{
-		return nullptr;
+		return false;
 	}
 
 	if (seedX < bounds.lo.x || seedX > bounds.hi.x || seedY < bounds.lo.y || seedY > bounds.hi.y)
 	{
-		return nullptr;
+		return false;
 	}
 
 	const size_t totalCells = static_cast<size_t>(width) * static_cast<size_t>(height);
 	const size_t seedIndex = static_cast<size_t>(seedX) * static_cast<size_t>(height) + static_cast<size_t>(seedY);
 	if (passabilityGrid[seedIndex] == PASS_BLOCKED)
 	{
-		return nullptr;
+		return false;
 	}
 
-	FlowFieldEntry *entry = allocateSlot(key);
-	entry->key = key;
-	entry->mapVersion = m_mapVersion;
-	entry->lastUsedSeq = ++m_lruClock;
-	entry->seedX = seedX;
-	entry->seedY = seedY;
-	entry->width = width;
-	entry->height = height;
-	entry->bounds = bounds;
-	entry->flowDir.assign(totalCells, FLOW_DIR_NONE);
-
-	m_costScratch.assign(totalCells, FLOW_COST_UNREACHABLE);
+	outFlowDir.assign(totalCells, FLOW_DIR_NONE);
+	scratch.costs.assign(totalCells, FLOW_COST_UNREACHABLE);
 
 	size_t bucketHead[DIAL_BUCKET_COUNT];
 	for (Int b = 0; b < DIAL_BUCKET_COUNT; ++b)
 	{
-		m_buckets[b].clear();
+		scratch.buckets[b].clear();
 		bucketHead[b] = 0;
 	}
 
-	m_costScratch[seedIndex] = 0;
-	entry->flowDir[seedIndex] = FLOW_DIR_GOAL;
-	m_buckets[0].push_back(packCell(seedX, seedY));
+	scratch.costs[seedIndex] = 0;
+	outFlowDir[seedIndex] = FLOW_DIR_GOAL;
+	scratch.buckets[0].push_back(packCell(seedX, seedY));
 
 	UnsignedInt currentCost = 0;
 	size_t queuedEntries = 1;
@@ -266,20 +507,20 @@ const PathfindFlowFieldManager::FlowFieldEntry *PathfindFlowFieldManager::buildF
 	while (queuedEntries > 0)
 	{
 		UnsignedInt bucketIdx = currentCost & bucketMask;
-		while (bucketHead[bucketIdx] >= m_buckets[bucketIdx].size())
+		while (bucketHead[bucketIdx] >= scratch.buckets[bucketIdx].size())
 		{
-			m_buckets[bucketIdx].clear();
+			scratch.buckets[bucketIdx].clear();
 			bucketHead[bucketIdx] = 0;
 			++currentCost;
 			bucketIdx = currentCost & bucketMask;
 		}
 
-		const UnsignedInt packed = m_buckets[bucketIdx][bucketHead[bucketIdx]++];
+		const UnsignedInt packed = scratch.buckets[bucketIdx][bucketHead[bucketIdx]++];
 		--queuedEntries;
 
-		if (bucketHead[bucketIdx] == m_buckets[bucketIdx].size())
+		if (bucketHead[bucketIdx] == scratch.buckets[bucketIdx].size())
 		{
-			m_buckets[bucketIdx].clear();
+			scratch.buckets[bucketIdx].clear();
 			bucketHead[bucketIdx] = 0;
 		}
 
@@ -287,8 +528,7 @@ const PathfindFlowFieldManager::FlowFieldEntry *PathfindFlowFieldManager::buildF
 		const Int uy = unpackY(packed);
 		const size_t uIdx = static_cast<size_t>(ux) * static_cast<size_t>(height) + static_cast<size_t>(uy);
 
-		// Skip stale queue entries superseded by a cheaper path.
-		if (m_costScratch[uIdx] < currentCost)
+		if (scratch.costs[uIdx] < currentCost)
 		{
 			continue;
 		}
@@ -315,11 +555,11 @@ const PathfindFlowFieldManager::FlowFieldEntry *PathfindFlowFieldManager::buildF
 			const UnsignedInt stepCost = COST_ORTHOGONAL + ((passState == PASS_SOFT_PENALTY) ? SOFT_CLEARANCE_PENALTY : 0u);
 			const UnsignedInt newCost = currentCost + stepCost;
 
-			if (newCost < m_costScratch[vIdx])
+			if (newCost < scratch.costs[vIdx])
 			{
-				m_costScratch[vIdx] = newCost;
-				entry->flowDir[vIdx] = OPPOSITE_DIR[d];
-				m_buckets[newCost & bucketMask].push_back(packCell(vx, vy));
+				scratch.costs[vIdx] = newCost;
+				outFlowDir[vIdx] = OPPOSITE_DIR[d];
+				scratch.buckets[newCost & bucketMask].push_back(packCell(vx, vy));
 				++queuedEntries;
 			}
 		}
@@ -349,17 +589,129 @@ const PathfindFlowFieldManager::FlowFieldEntry *PathfindFlowFieldManager::buildF
 			const UnsignedInt stepCost = COST_DIAGONAL + ((passState == PASS_SOFT_PENALTY) ? SOFT_CLEARANCE_PENALTY : 0u);
 			const UnsignedInt newCost = currentCost + stepCost;
 
-			if (newCost < m_costScratch[vIdx])
+			if (newCost < scratch.costs[vIdx])
 			{
-				m_costScratch[vIdx] = newCost;
-				entry->flowDir[vIdx] = OPPOSITE_DIR[d];
-				m_buckets[newCost & bucketMask].push_back(packCell(vx, vy));
+				scratch.costs[vIdx] = newCost;
+				outFlowDir[vIdx] = OPPOSITE_DIR[d];
+				scratch.buckets[newCost & bucketMask].push_back(packCell(vx, vy));
 				++queuedEntries;
 			}
 		}
 	}
 
+	return true;
+}
+
+const PathfindFlowFieldManager::FlowFieldEntry *PathfindFlowFieldManager::buildFlowField(
+	const FlowFieldKey &key,
+	Int width,
+	Int height,
+	const IRegion2D &bounds,
+	Int seedX,
+	Int seedY,
+	const UnsignedByte *passabilityGrid)
+{
+	FlowFieldEntry *entry = allocateSlot(key);
+	if (!runDialDijkstra(width, height, bounds, seedX, seedY, passabilityGrid, m_workerScratches[0], entry->flowDir))
+	{
+		return nullptr;
+	}
+
+	entry->key = key;
+	entry->mapVersion = m_mapVersion;
+	entry->lastUsedSeq = ++m_lruClock;
+	entry->seedX = seedX;
+	entry->seedY = seedY;
+	entry->width = width;
+	entry->height = height;
+	entry->bounds = bounds;
 	return entry;
+}
+
+Int PathfindFlowFieldManager::buildFlowFieldsParallel(
+	const ParallelBuildJob *jobs,
+	size_t jobCount,
+	Int width,
+	Int height,
+	const UnsignedByte *cellSnapshot)
+{
+	if (jobs == nullptr || jobCount == 0 || width <= 0 || height <= 0 || cellSnapshot == nullptr)
+	{
+		return 0;
+	}
+
+	if (jobCount > static_cast<size_t>(CACHE_CAPACITY))
+	{
+		jobCount = static_cast<size_t>(CACHE_CAPACITY);
+	}
+
+	if (m_parallelResults.size() < jobCount)
+	{
+		m_parallelResults.resize(jobCount);
+	}
+
+	m_activeJobs = jobs;
+	m_activeJobCount = jobCount;
+	m_activeWidth = width;
+	m_activeHeight = height;
+	m_activeSnapshot = cellSnapshot;
+	m_nextJobIndex.store(0, std::memory_order_relaxed);
+	m_completedJobs.store(0, std::memory_order_relaxed);
+
+	if (jobCount > 1)
+	{
+		ensureWorkersStarted();
+	}
+
+	if (jobCount > 1 && !m_workers.empty())
+	{
+		{
+			std::lock_guard<std::mutex> lock(m_poolMutex);
+			++m_batchEpoch;
+		}
+		m_cvWork.notify_all();
+
+		// Main thread also participates using scratch[0] so zero cores sit idle.
+		executeBatchJobs(0);
+
+		std::unique_lock<std::mutex> lock(m_poolMutex);
+		m_cvDone.wait(lock, [this]()
+		{
+			return m_completedJobs.load(std::memory_order_acquire) >= m_activeJobCount;
+		});
+	}
+	else
+	{
+		executeBatchJobs(0);
+	}
+
+	// Commit results on the main thread in exact deterministic job index order [0..jobCount-1].
+	Int committed = 0;
+	for (size_t i = 0; i < jobCount; ++i)
+	{
+		ParallelJobResult &res = m_parallelResults[i];
+		if (!res.valid)
+		{
+			continue;
+		}
+
+		FlowFieldEntry *slot = allocateSlot(res.key);
+		slot->key = res.key;
+		slot->mapVersion = m_mapVersion;
+		slot->lastUsedSeq = ++m_lruClock;
+		slot->seedX = res.seedX;
+		slot->seedY = res.seedY;
+		slot->width = res.width;
+		slot->height = res.height;
+		slot->bounds = res.bounds;
+		slot->flowDir.swap(res.flowDir);
+		++committed;
+	}
+
+	m_activeJobs = nullptr;
+	m_activeJobCount = 0;
+	m_activeSnapshot = nullptr;
+	return committed;
 }
 
 Bool PathfindFlowFieldManager::tracePath(
@@ -414,7 +766,6 @@ Bool PathfindFlowFieldManager::tracePath(
 
 		if (dir == FLOW_DIR_GOAL)
 		{
-			// Reached the cluster seed; append seed corner and final exact goal cell.
 			ICoord2D seedPt;
 			seedPt.x = curX;
 			seedPt.y = curY;

@@ -85,6 +85,7 @@ class PartitionManager;
 class PartitionData;
 class PartitionFilter;
 class PartitionCell;
+class PartitionContactList;
 class Player;
 class PolygonTrigger;
 class Squad;
@@ -1250,6 +1251,9 @@ private:
 	Int							m_cellCountY;			///< number of cells, y
 	Int							m_totalCellCount;	///< x * y
 	PartitionCell*	m_cells;					///< array of cells
+	std::vector<UnsignedInt> m_nonEmptyCellBits;	///< L1-cache 1-bit-per-cell occupancy mask for fast GCO empty-cell skipping
+	std::vector<CellAndObjectIntersection*> m_cellCoiHeads;	///< Compact parallel head pointer table avoiding 216-byte PartitionCell loads in GCO
+	PartitionContactList* m_reusableContactList;	///< Persistent generation-stamped contact list (zero per-frame memset/node allocation)
 	PartitionData*	m_dirtyModules;
 	Bool						m_updatedSinceLastReset;	///< Used to force a return of OBJECTSHROUD_INVALID before update has been called.
 
@@ -1346,6 +1350,20 @@ public:
 	/// return the PartitionCell located at cell coordinates (x,y).
 	PartitionCell *getCellAt(Int x, Int y);
 	const PartitionCell *getCellAt(Int x, Int y) const;
+
+	/// Synchronize L1-cache occupancy bitset and compact COI head table when a cell's COI list changes.
+	inline void friend_updateCellOccupancy(Int cellX, Int cellY, CellAndObjectIntersection *head)
+	{
+		if (m_cellCoiHeads.empty())
+			return;
+		const Int idx = cellY * m_cellCountX + cellX;
+		m_cellCoiHeads[idx] = head;
+		const UnsignedInt bit = 1u << (idx & 31);
+		if (head != nullptr)
+			m_nonEmptyCellBits[idx >> 5] |= bit;
+		else
+			m_nonEmptyCellBits[idx >> 5] &= ~bit;
+	}
 
 	/// A convenience function to reveal shroud at some location
 	// Queuing does not give you control of the timestamp to enforce the queue.  I own the delay, you don't.
